@@ -4,4 +4,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository
 
-This is `wm_exp` — an experimental repository. No build system, dependencies, or source code have been added yet. Update this file as the project takes shape.
+`wm_exp` is a research experiment built on top of LeWorldModel (LeWM). It contains the original LeWM code plus a new spherical world model variant (SWM). The full experimental plan is in [`plan_v2.md`](plan_v2.md); the experiment-specific README is [`README_SWM.md`](README_SWM.md).
+
+Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch Lightning + Hydra. No separate build step.
+
+## Experiment: Spherical World Model (SWM) — V0
+
+**Research question:** Can replacing LeWM's Euclidean representations + SIGReg with spherical representations + a simple spread loss improve performance, particularly on Two-Room (where LeWM scores 87% vs. 100% for simpler baselines)?
+
+**Core hypothesis:** SIGReg forces embeddings toward an isotropic Gaussian, over-constraining low-intrinsic-dimension environments. A spherical geometry may better preserve the state-space topology.
+
+**Three-stage ladder** (each stage only runs if the previous succeeds):
+- **V0 (implemented):** Spherical encoder/predictor + cosine pred loss + pairwise spread loss
+- **V1:** Add vMF parameterisation (per-observation concentration κ) for adaptive resolution
+- **V2:** Add a learnable ball-cap constraint for OOD detection
+
+## Codebase Structure
+
+| File | Role |
+|---|---|
+| `jepa.py` | `JEPA` (LeWM baseline) + `SphericalJEPA` (V0, subclasses JEPA) |
+| `module.py` | Shared architecture modules + `cosine_pred_loss()`, `spread_loss()` |
+| `train.py` | LeWM training entry point (`python train.py data=tworoom`) |
+| `train_swm.py` | SWM training entry point (`python train_swm.py data=tworoom`) |
+| `eval.py` | Shared evaluation entry point (works for both LeWM and SWM) |
+| `config/train/lewm.yaml` | LeWM training config |
+| `config/train/swm.yaml` | SWM training config (defaults to Two-Room, embed_dim=64) |
+
+## Key Design Decisions
+
+- `SphericalJEPA` overrides only `encode()`, `predict()`, `criterion()` — `rollout()` and `get_cost()` are inherited unchanged, so the CEM planner needs no modification.
+- Projectors in SWM are plain `nn.Linear` (no BatchNorm) — BatchNorm rescales magnitude and conflicts with the subsequent L2 normalisation.
+- `spread_loss` operates on all B×T tokens together (not split by context/target), keeping it simple and statistically stable.
+- Single trade-off hyperparameter `loss.spread.weight` (λ), same count as LeWM's `loss.sigreg.weight`.
+
+## Running Experiments
+
+```bash
+# Train SWM on Two-Room (primary benchmark)
+python train_swm.py data=tworoom
+
+# Train LeWM baseline (for comparison)
+python train.py data=tworoom
+
+# Evaluate (both models use the same eval.py)
+python eval.py --config-name=tworoom.yaml policy=<subdir>/swm
+python eval.py --config-name=tworoom.yaml policy=<subdir>/lewm
+```
+
+Run 3–5 seeds per method. Report mean ± std success rate on Two-Room.
