@@ -149,5 +149,42 @@ class JEPA(nn.Module):
         info_dict = self.rollout(info_dict, action_candidates)
 
         cost = self.criterion(info_dict)
-        
+
         return cost
+
+
+class SphericalJEPA(JEPA):
+    """JEPA with L2-normalised (spherical) representations.
+
+    Identical to JEPA except:
+    - encode() projects embeddings onto S^{d-1} after the projector.
+    - predict() projects predicted embeddings onto S^{d-1} after pred_proj.
+    - criterion() uses cosine distance instead of MSE for planning cost.
+
+    rollout() and get_cost() are inherited unchanged — they call self.encode,
+    self.predict, and self.criterion, which are all overridden here.
+    """
+
+    def encode(self, info):
+        info = super().encode(info)
+        info["emb"] = F.normalize(info["emb"], dim=-1, eps=1e-8)
+        return info
+
+    def predict(self, emb, act_emb):
+        preds = super().predict(emb, act_emb)
+        return F.normalize(preds, dim=-1, eps=1e-8)
+
+    def criterion(self, info_dict: dict):
+        """Cosine distance planning cost (replaces MSE).
+
+        pred_emb: (B, S, T, D)  — unit vectors
+        goal_emb: (B, S, T, D)  — unit vectors
+        Returns cost: (B, S)
+        """
+        pred_emb = info_dict["predicted_emb"]
+        goal_emb = info_dict["goal_emb"]
+        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+
+        # dot product of unit vectors == cosine similarity; 1 - sim == cosine distance
+        cost = 1.0 - (pred_emb[..., -1:, :] * goal_emb[..., -1:, :].detach()).sum(dim=-1)
+        return cost.squeeze(-1)  # (B, S)

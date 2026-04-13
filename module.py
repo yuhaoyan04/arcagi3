@@ -241,6 +241,29 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+def cosine_pred_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Prediction loss on the sphere: mean cosine distance.
+
+    pred, target: (B, T, D) — unit vectors on S^{d-1}.
+    Returns scalar in [0, 2]; 0 means perfect alignment.
+    """
+    return (1.0 - (pred * target).sum(dim=-1)).mean()
+
+
+def spread_loss(emb: torch.Tensor) -> torch.Tensor:
+    """Anti-collapse loss: mean pairwise cosine similarity across the batch.
+
+    emb: (B, T, D) — unit vectors on S^{d-1}.
+    Minimising this pushes all B*T representations apart on the sphere.
+    Equivalent to the simplified uniformity loss from Wang & Isola 2020.
+    """
+    z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
+    sim = z @ z.T                       # (B*T, B*T)
+    n = sim.size(0)
+    mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+    return sim[mask].mean()
+
+
 class ARPredictor(nn.Module):
     """Autoregressive predictor for next-step embedding prediction."""
 
