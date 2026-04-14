@@ -8,6 +8,10 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
+try:
+    from swanlab.integration.lightning import SwanLabLogger
+except ImportError:
+    SwanLabLogger = None
 from omegaconf import OmegaConf, open_dict
 from torch import nn
 
@@ -146,7 +150,13 @@ def run(cfg):
     run_dir = Path(swm.data.utils.get_cache_dir(), run_id)
 
     logger = None
-    if cfg.wandb.enabled:
+    backend = cfg.get("logger_backend", "swanlab")
+    if backend == "swanlab" and cfg.swanlab.enabled:
+        if SwanLabLogger is None:
+            raise ImportError("swanlab is not installed. Run: pip install swanlab")
+        logger = SwanLabLogger(**cfg.swanlab.config)
+        logger.log_hyperparams(OmegaConf.to_container(cfg))
+    elif backend == "wandb" and cfg.wandb.enabled:
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
