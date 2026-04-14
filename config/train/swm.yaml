@@ -35,8 +35,8 @@ optimizer:
 wandb:
   enabled: True
   config:
-    entity: lewm
-    project: swm
+    entity: qun-team
+    project: worldmodels
     name: ${output_model_name}
     id: ${subdir}
     resume: allow
@@ -46,7 +46,7 @@ wm:
   type: swm
   history_size: 3
   num_preds: 1
-  embed_dim: 64  # sphere is compact; start smaller than LeWM's 192
+  embed_dim: 64 # sphere is compact; start smaller than LeWM's 192
 
 predictor:
   depth: 6
@@ -58,4 +58,4 @@ predictor:
 
 loss:
   spread:
-    weight: 0.1  # λ balancing pred_loss vs spread_loss; tune if collapse occurs
+    weight: 0.1 # λ balancing pred_loss vs spread_loss; tune if collapse occurs
