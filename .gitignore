@@ -1,5 +1,7 @@
 # Projects
 *.tmp
+swanlog/
+outputs/
 
 # Mac
 .DS_Store

@@ -9,7 +9,7 @@ import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
 try:
-    from swanlab.integration.lightning import SwanLabLogger
+    from swanlab.integration.pytorch_lightning import SwanLabLogger
 except ImportError:
     SwanLabLogger = None
 from omegaconf import OmegaConf, open_dict
