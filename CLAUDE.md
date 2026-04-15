@@ -8,14 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch Lightning + Hydra. No separate build step.
 
+When necessary, update `AGENTS.md` with the minimal rule required to keep its guidance accurate.
+
 ## Experiment: Spherical World Model (SWM) — V0
 
-**Research question:** Can replacing LeWM's Euclidean representations + SIGReg with spherical representations + a simple spread loss improve performance, particularly on Two-Room (where LeWM scores 87% vs. 100% for simpler baselines)?
+**Research question:** Can replacing LeWM's Euclidean representations + SIGReg with spherical representations + a uniformity-oriented anti-collapse loss improve performance, particularly on Two-Room (where LeWM scores 87% vs. 100% for simpler baselines)?
 
 **Core hypothesis:** SIGReg forces embeddings toward an isotropic Gaussian, over-constraining low-intrinsic-dimension environments. A spherical geometry may better preserve the state-space topology.
 
 **Three-stage ladder** (each stage only runs if the previous succeeds):
-- **V0 (implemented):** Spherical encoder/predictor + cosine pred loss + pairwise spread loss
+- **V0 (implemented):** Spherical encoder/predictor + cosine pred loss + configurable spread/uniformity regularizer
 - **V1:** Add vMF parameterisation (per-observation concentration κ) for adaptive resolution
 - **V2:** Add a learnable ball-cap constraint for OOD detection
 
@@ -24,7 +26,7 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 | File | Role |
 |---|---|
 | `jepa.py` | `JEPA` (LeWM baseline) + `SphericalJEPA` (V0, subclasses JEPA) |
-| `module.py` | Shared architecture modules + `cosine_pred_loss()`, `spread_loss()` |
+| `module.py` | Shared architecture modules + `cosine_pred_loss()`, `spread_loss()`, `uniformity_loss()` |
 | `train.py` | LeWM training entry point (`python train.py data=tworoom`) |
 | `train_swm.py` | SWM training entry point (`python train_swm.py data=tworoom`) |
 | `eval.py` | Shared evaluation entry point (works for both LeWM and SWM) |
@@ -34,9 +36,9 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 ## Key Design Decisions
 
 - `SphericalJEPA` overrides only `encode()`, `predict()`, `criterion()` — `rollout()` and `get_cost()` are inherited unchanged, so the CEM planner needs no modification.
-- Projectors in SWM are plain `nn.Linear` (no BatchNorm) — BatchNorm rescales magnitude and conflicts with the subsequent L2 normalisation.
-- `spread_loss` operates on all B×T tokens together (not split by context/target), keeping it simple and statistically stable.
-- Single trade-off hyperparameter `loss.spread.weight` (λ), same count as LeWM's `loss.sigreg.weight`.
+- SWM projectors use `BatchNorm1d` before the final L2 normalisation.
+- Both `spread_loss` and `uniformity_loss` operate on all B×T tokens together (not split by context/target).
+- The default SWM anti-collapse regularizer is `loss.regularizer.type=uniformity`, with shared weight `loss.regularizer.weight`.
 
 ## Running Experiments
 

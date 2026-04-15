@@ -250,6 +250,13 @@ def cosine_pred_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - (pred * target).sum(dim=-1)).mean()
 
 
+def _pairwise_offdiag(x: torch.Tensor) -> torch.Tensor:
+    """Return all off-diagonal pairwise entries for a flattened batch."""
+    n = x.size(0)
+    mask = ~torch.eye(n, dtype=torch.bool, device=x.device)
+    return x[mask]
+
+
 def spread_loss(emb: torch.Tensor, margin: float) -> torch.Tensor:
     """Anti-collapse loss: mean squared hinge on pairwise cosine similarity.
 
@@ -259,10 +266,21 @@ def spread_loss(emb: torch.Tensor, margin: float) -> torch.Tensor:
     configured margin.
     """
     z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
-    sim = z @ z.T                       # (B*T, B*T)
-    n = sim.size(0)
-    mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
-    return torch.clamp_min(sim[mask] - margin, 0.0).square().mean()
+    sim = z @ z.T                      # (B*T, B*T)
+    return torch.clamp_min(_pairwise_offdiag(sim) - margin, 0.0).square().mean()
+
+
+def uniformity_loss(emb: torch.Tensor, t: float) -> torch.Tensor:
+    """Wang & Isola uniformity loss on unit-normalized embeddings.
+
+    emb: (B, T, D) — unit vectors on S^{d-1}.
+    Computes log mean_{i != j} exp(-t * ||mu_i - mu_j||^2).
+    """
+    z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
+    sq_dists = torch.pdist(z, p=2).square()
+    if sq_dists.numel() == 0:
+        return z.new_tensor(0.0)
+    return torch.exp(-t * sq_dists).mean().log()
 
 
 class ARPredictor(nn.Module):

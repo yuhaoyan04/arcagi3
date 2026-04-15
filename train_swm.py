@@ -16,7 +16,7 @@ from omegaconf import OmegaConf, open_dict
 from torch import nn
 
 from jepa import SphericalJEPA
-from module import ARPredictor, Embedder, cosine_pred_loss, spread_loss
+from module import ARPredictor, Embedder, MLP, cosine_pred_loss, spread_loss, uniformity_loss
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -25,13 +25,13 @@ def swm_forward(self, batch, stage, cfg):
 
     Losses:
       pred_loss   — cosine distance between predicted and target embeddings
-      spread_loss — mean squared hinge on pairwise cosine similarity
-      loss        — pred_loss + λ * spread_loss
+      reg_loss    — configurable anti-collapse loss on the sphere
+      loss        — pred_loss + λ * reg_loss
     """
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.spread.weight
-    margin = cfg.loss.spread.margin
+    reg_type = cfg.loss.regularizer.type
+    lambd = cfg.loss.regularizer.weight
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -48,8 +48,16 @@ def swm_forward(self, batch, stage, cfg):
     pred_emb = self.model.predict(ctx_emb, ctx_act)    # predicted, also on sphere
 
     output["pred_loss"] = cosine_pred_loss(pred_emb, tgt_emb)
-    output["spread_loss"] = spread_loss(emb, margin)
-    output["loss"] = output["pred_loss"] + lambd * output["spread_loss"]
+    if reg_type == "spread":
+        output["spread_loss"] = spread_loss(emb, cfg.loss.spread.margin)
+        output["reg_loss"] = output["spread_loss"]
+    elif reg_type == "uniformity":
+        output["uniformity_loss"] = uniformity_loss(emb, cfg.loss.uniformity.t)
+        output["reg_loss"] = output["uniformity_loss"]
+    else:
+        raise ValueError(f"Unsupported loss.regularizer.type: {reg_type}")
+
+    output["loss"] = output["pred_loss"] + lambd * output["reg_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
@@ -114,10 +122,18 @@ def run(cfg):
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
-    # Simple linear projectors — no BatchNorm, since L2 normalisation follows.
-    # BatchNorm rescales magnitude, which would fight the normalisation.
-    projector = nn.Linear(hidden_dim, embed_dim)
-    pred_proj = nn.Linear(hidden_dim, embed_dim)
+    projector = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=nn.BatchNorm1d,
+    )
+    pred_proj = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=nn.BatchNorm1d,
+    )
 
     world_model = SphericalJEPA(
         encoder=encoder,
