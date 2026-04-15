@@ -69,3 +69,4 @@ predictor:
 loss:
   spread:
     weight: 0.1 # λ balancing pred_loss vs spread_loss; tune if collapse occurs
+    margin: 0.0 # m in max(0, mu_i^T mu_j - m)^2

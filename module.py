@@ -250,18 +250,19 @@ def cosine_pred_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - (pred * target).sum(dim=-1)).mean()
 
 
-def spread_loss(emb: torch.Tensor) -> torch.Tensor:
-    """Anti-collapse loss: mean pairwise cosine similarity across the batch.
+def spread_loss(emb: torch.Tensor, margin: float) -> torch.Tensor:
+    """Anti-collapse loss: mean squared hinge on pairwise cosine similarity.
 
     emb: (B, T, D) — unit vectors on S^{d-1}.
-    Minimising this pushes all B*T representations apart on the sphere.
-    Equivalent to the simplified uniformity loss from Wang & Isola 2020.
+    Computes mean_{i != j} max(0, <mu_i, mu_j> - m)^2.
+    Minimising this only penalises pairs whose cosine similarity exceeds the
+    configured margin.
     """
     z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
     sim = z @ z.T                       # (B*T, B*T)
     n = sim.size(0)
     mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
-    return sim[mask].mean()
+    return torch.clamp_min(sim[mask] - margin, 0.0).square().mean()
 
 
 class ARPredictor(nn.Module):

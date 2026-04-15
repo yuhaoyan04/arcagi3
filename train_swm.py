@@ -25,12 +25,13 @@ def swm_forward(self, batch, stage, cfg):
 
     Losses:
       pred_loss   — cosine distance between predicted and target embeddings
-      spread_loss — mean pairwise cosine similarity (anti-collapse)
+      spread_loss — mean squared hinge on pairwise cosine similarity
       loss        — pred_loss + λ * spread_loss
     """
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.spread.weight
+    margin = cfg.loss.spread.margin
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -47,7 +48,7 @@ def swm_forward(self, batch, stage, cfg):
     pred_emb = self.model.predict(ctx_emb, ctx_act)    # predicted, also on sphere
 
     output["pred_loss"] = cosine_pred_loss(pred_emb, tgt_emb)
-    output["spread_loss"] = spread_loss(emb)
+    output["spread_loss"] = spread_loss(emb, margin)
     output["loss"] = output["pred_loss"] + lambd * output["spread_loss"]
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
