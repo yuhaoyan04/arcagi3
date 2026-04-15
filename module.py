@@ -283,6 +283,24 @@ def uniformity_loss(emb: torch.Tensor, t: float) -> torch.Tensor:
     return torch.exp(-t * sq_dists).mean().log()
 
 
+def infonce_loss(emb: torch.Tensor, temperature: float) -> torch.Tensor:
+    """InfoNCE-style uniformity loss over all non-identical batch elements.
+
+    emb: (B, T, D) — unit vectors on S^{d-1}.
+    Treats every other element in the batch-time flattening as a negative and
+    minimises the normalized self-match probability.
+    """
+    z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
+    n = z.size(0)
+    if n < 2:
+        return z.new_tensor(0.0)
+
+    logits = (z @ z.T) / temperature
+    logits = logits.masked_fill(torch.eye(n, dtype=torch.bool, device=z.device), float("-inf"))
+    log_denom = torch.logsumexp(logits, dim=-1)
+    return (-1.0 + log_denom).mean()
+
+
 class ARPredictor(nn.Module):
     """Autoregressive predictor for next-step embedding prediction."""
 

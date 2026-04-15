@@ -16,8 +16,18 @@ from omegaconf import OmegaConf, open_dict
 from torch import nn
 
 from jepa import SphericalJEPA
-from module import ARPredictor, Embedder, MLP, cosine_pred_loss, spread_loss, uniformity_loss
+from module import ARPredictor, Embedder, cosine_pred_loss, infonce_loss, spread_loss, uniformity_loss
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+
+
+def build_projection_head(input_dim: int, output_dim: int, head_type: str) -> nn.Module:
+    if head_type == "linear":
+        return nn.Linear(input_dim, output_dim)
+    if head_type == "ln":
+        return nn.Sequential(nn.Linear(input_dim, output_dim), nn.LayerNorm(output_dim))
+    if head_type == "bn":
+        return nn.Sequential(nn.Linear(input_dim, output_dim), nn.BatchNorm1d(output_dim))
+    raise ValueError(f"Unsupported projection_head.type: {head_type}")
 
 
 def swm_forward(self, batch, stage, cfg):
@@ -54,6 +64,9 @@ def swm_forward(self, batch, stage, cfg):
     elif reg_type == "uniformity":
         output["uniformity_loss"] = uniformity_loss(emb, cfg.loss.uniformity.t)
         output["reg_loss"] = output["uniformity_loss"]
+    elif reg_type == "infonce":
+        output["infonce_loss"] = infonce_loss(emb, cfg.loss.infonce.temperature)
+        output["reg_loss"] = output["infonce_loss"]
     else:
         raise ValueError(f"Unsupported loss.regularizer.type: {reg_type}")
 
@@ -122,18 +135,9 @@ def run(cfg):
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
-    projector = MLP(
-        input_dim=hidden_dim,
-        output_dim=embed_dim,
-        hidden_dim=2048,
-        norm_fn=nn.BatchNorm1d,
-    )
-    pred_proj = MLP(
-        input_dim=hidden_dim,
-        output_dim=embed_dim,
-        hidden_dim=2048,
-        norm_fn=nn.BatchNorm1d,
-    )
+    head_type = cfg.encoder.projection_head.type
+    projector = build_projection_head(hidden_dim, embed_dim, head_type)
+    pred_proj = build_projection_head(hidden_dim, embed_dim, head_type)
 
     world_model = SphericalJEPA(
         encoder=encoder,

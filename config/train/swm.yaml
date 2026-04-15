@@ -14,6 +14,10 @@ patch_size: 14
 encoder_scale: tiny
 dump_object: True
 
+encoder:
+  projection_head:
+    type: bn # linear, ln, or bn
+
 trainer:
   max_epochs: 10
   devices: auto
@@ -69,9 +73,11 @@ predictor:
 
 loss:
   regularizer:
-    type: uniformity # spread or uniformity
+    type: uniformity # spread, uniformity, or infonce
     weight: 0.1 # λ balancing pred_loss vs anti-collapse regularization
   spread:
     margin: 0.0 # m in max(0, mu_i^T mu_j - m)^2
   uniformity:
     t: 2.0 # Wang & Isola temperature in log E[exp(-t ||mu_i - mu_j||^2)]
+  infonce:
+    temperature: 0.1 # softmax temperature for batchwise InfoNCE negatives
