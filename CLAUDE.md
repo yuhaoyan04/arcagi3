@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch Lightning + Hydra. No separate build step.
 
 When necessary, update `AGENTS.md` with the minimal rule required to keep its guidance accurate.
+Make minimal necessary changes each time.
 
 ## Experiment: Spherical World Model (SWM) — V0
 

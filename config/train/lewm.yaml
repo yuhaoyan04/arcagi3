@@ -3,7 +3,8 @@ defaults:
   - data: pusht
 
 output_model_name: lewm
-subdir: ${hydra:job.id}
+exp_name: ${output_model_name}
+subdir: ${exp_name}
 
 num_workers: 6
 train_split: 0.9
@@ -39,7 +40,7 @@ swanlab:
   config:
     project: worldmodels
     workspace: qunteam
-    experiment_name: ${output_model_name}
+    experiment_name: ${exp_name}
     logdir: /tmp/swanlab
 
 wandb:
@@ -47,7 +48,7 @@ wandb:
   config:
     entity: qun-team
     project: worldmodels
-    name: ${output_model_name}
+    name: ${exp_name}
     id: ${subdir}
     resume: allow
     log_model: False
