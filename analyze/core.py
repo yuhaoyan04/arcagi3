@@ -11,10 +11,8 @@ from omegaconf import OmegaConf
 def resolve_checkpoint_path(checkpoint: str, cache_dir: str | None = None) -> Path:
     path = Path(checkpoint)
     if not path.exists():
-        path = Path(
-            cache_dir or swm.data.utils.get_cache_dir(sub_folder="checkpoints"),
-            checkpoint,
-        )
+        root = Path(cache_dir) if cache_dir is not None else swm.data.utils.get_cache_dir()
+        path = Path(root, checkpoint)
 
     if path.is_dir():
         candidates = sorted(
@@ -37,8 +35,11 @@ def resolve_checkpoint_path(checkpoint: str, cache_dir: str | None = None) -> Pa
     return path
 
 
-def load_encoder_model(checkpoint: str, cache_dir: str | None = None) -> torch.nn.Module:
+def load_encoder_model(
+    checkpoint: str, cache_dir: str | None = None
+) -> tuple[torch.nn.Module, Path]:
     ckpt_path = resolve_checkpoint_path(checkpoint, cache_dir)
+    print(f"[analyze] Loading checkpoint: {ckpt_path}")
     payload = torch.load(ckpt_path, weights_only=False, map_location="cpu")
 
     def scan(module):
@@ -54,7 +55,7 @@ def load_encoder_model(checkpoint: str, cache_dir: str | None = None) -> torch.n
     model = scan(payload)
     if model is None:
         raise RuntimeError(f"No module with encode() found in checkpoint {ckpt_path}")
-    return model
+    return model, ckpt_path
 
 
 def to_numpy(value):
@@ -73,6 +74,10 @@ def slice_frame(value, frame_index: int, sequence_len: int):
 
 
 def collect_embeddings(model, loader, target_keys, frame_index, max_samples, device):
+    print(
+        f"[analyze] Extracting embeddings: frame_index={frame_index}, "
+        f"max_samples={max_samples}, device={device}"
+    )
     embeddings = []
     targets = {key: [] for key in target_keys}
     seen = 0
@@ -110,6 +115,10 @@ def collect_embeddings(model, loader, target_keys, frame_index, max_samples, dev
         key: np.concatenate([to_numpy(v) for v in values], axis=0)
         for key, values in targets.items()
     }
+    print(
+        f"[analyze] Extracted embeddings: n_samples={stacked_embeddings.shape[0]}, "
+        f"dim={stacked_embeddings.shape[1]}"
+    )
     return stacked_embeddings, stacked_targets
 
 
@@ -233,6 +242,7 @@ def run_tsne(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: 
         raise ValueError("t-SNE requires at least 2 samples")
 
     perplexity = min(float(cfg.perplexity), max(1.0, n_samples - 1.0))
+    print(f"[analyze] Running t-SNE: n_samples={n_samples}, perplexity={perplexity}")
     tsne = sk["TSNE"](
         n_components=cfg.n_components,
         perplexity=perplexity,
@@ -252,6 +262,10 @@ def run_umap(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: 
 
     umap = maybe_import_umap()
     n_neighbors = min(int(cfg.n_neighbors), max(2, embeddings.shape[0] - 1))
+    print(
+        f"[analyze] Running UMAP: n_samples={embeddings.shape[0]}, "
+        f"n_neighbors={n_neighbors}, n_components={cfg.n_components}"
+    )
     reducer = umap.UMAP(
         n_components=cfg.n_components,
         n_neighbors=n_neighbors,
@@ -274,6 +288,10 @@ def run_spherical_tsne(
         raise ValueError("Spherical t-SNE requires at least 2 samples")
 
     perplexity = min(float(cfg.perplexity), max(1.0, n_samples - 1.0))
+    print(
+        f"[analyze] Running spherical t-SNE: n_samples={n_samples}, "
+        f"perplexity={perplexity}"
+    )
     tsne = sk["TSNE"](
         n_components=3,
         perplexity=perplexity,
@@ -304,6 +322,7 @@ def infer_probe_task(y: np.ndarray, max_classes: int) -> str:
 
 def run_linear_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int):
     sk = maybe_import_sklearn()
+    print(f"[analyze] Running linear probes: targets={list(cfg.target_keys)}")
     results = {}
 
     for key in cfg.target_keys:
@@ -346,6 +365,10 @@ def run_linear_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cf
 
 def run_mlp_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int):
     sk = maybe_import_sklearn()
+    print(
+        f"[analyze] Running MLP probes: targets={list(cfg.target_keys)}, "
+        f"hidden_layers={list(cfg.hidden_layers)}"
+    )
     results = {}
 
     hidden_layers = tuple(int(x) for x in cfg.hidden_layers)
@@ -411,6 +434,7 @@ def save_results(
     spherical_tsne_results=None,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[analyze] Saving analysis outputs to: {output_dir}")
     with (output_dir / "summary.json").open("w") as f:
         json.dump(
             {

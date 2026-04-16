@@ -8,8 +8,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch Lightning + Hydra. No separate build step.
 
-When necessary, update `AGENTS.md` with the minimal rule required to keep its guidance accurate.
-Make minimal necessary changes each time.
+## Working Rules
+
+1. Prefer minimal changes first.
+
+2. Prefer comprehensive minimal fixes over narrowly local ones.
+
+3. Keep options simple unless the user asks for more.
+
+4. Do not invent details when the repo already has an answer.
+
+5. If something is underspecified, use the existing code as the default source of truth.
+
+6. If assumptions still remain, keep them small and say them explicitly.
+
+7. Update `AGENTS.md` only when a new rule is necessary and keep the rule general.
+
+8. Add visibility when an operation may take noticeable time.
+
+9. Go ahead without asking for small, local fixes.
+
+10. For a larger patch, present a short plan and ask for permission before proceeding.
+
+11. Review your changes against these working rules before finishing; if you find a small issue, fix it.
 
 ## Experiment: Spherical World Model (SWM) — V0
 

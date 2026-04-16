@@ -10,7 +10,6 @@ from analyze.core import (
     collect_embeddings,
     load_encoder_model,
     run_mlp_probes,
-    resolve_checkpoint_path,
     run_linear_probes,
     run_spherical_tsne,
     run_tsne,
@@ -22,7 +21,13 @@ from utils import get_img_preprocessor
 
 
 def build_dataset(cfg: DictConfig):
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    print(f"[analyze] Loading dataset: {cfg.data.dataset.name}")
+    dataset = swm.data.HDF5Dataset(
+        **cfg.data.dataset,
+        transform=None,
+        cache_dir=cfg.cache_dir,
+    )
+    print(f"[analyze] Dataset path: {dataset.h5_path}")
     dataset.transform = spt.data.transforms.Compose(
         get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)
     )
@@ -31,8 +36,7 @@ def build_dataset(cfg: DictConfig):
 
 @hydra.main(version_base=None, config_path="./config/analyze", config_name="base")
 def run(cfg: DictConfig):
-    checkpoint_path = resolve_checkpoint_path(cfg.checkpoint, cfg.cache_dir)
-    model = load_encoder_model(cfg.checkpoint, cfg.cache_dir)
+    model, checkpoint_path = load_encoder_model(cfg.checkpoint, cfg.cache_dir)
     dataset = build_dataset(cfg)
 
     loader = torch.utils.data.DataLoader(
