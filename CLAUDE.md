@@ -10,11 +10,15 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 
 ## Working Rules
 
+### Scope
+
 1. Prefer minimal changes first.
 
 2. Prefer comprehensive minimal fixes over narrowly local ones.
 
 3. Keep options simple unless the user asks for more.
+
+### Source of Truth
 
 4. Do not invent details when the repo already has an answer.
 
@@ -22,17 +26,27 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 
 6. If assumptions still remain, keep them small and say them explicitly.
 
-7. Update `AGENTS.md` only when a new rule is necessary and keep the rule general.
+### Process
 
-8. Add visibility when an operation may take noticeable time.
+7. Go ahead without asking for small, local fixes.
 
-9. Go ahead without asking for small, local fixes.
+8. For a larger patch, present a short plan and ask for permission before proceeding.
 
-10. For a larger patch, present a short plan and ask for permission before proceeding.
+9. Review your changes against these working rules before finishing; if you find a small issue, fix it.
 
-11. Review your changes against these working rules before finishing; if you find a small issue, fix it.
+10. Add visibility when an operation may take noticeable time.
 
-12. Run `ruff format` after edits.
+11. Run `ruff format` after edits.
+
+### Maintenance
+
+12. Update `AGENTS.md` only when a new rule is necessary and keep the rule general.
+
+### Commits
+
+13. Write concise and informative git commit messages.
+
+14. Use bulleted detail lines in commit messages when needed.
 
 ## Experiment: Spherical World Model (SWM) — V0
 
