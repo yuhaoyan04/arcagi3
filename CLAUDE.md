@@ -32,6 +32,8 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 
 11. Review your changes against these working rules before finishing; if you find a small issue, fix it.
 
+12. Run `ruff format` after edits.
+
 ## Experiment: Spherical World Model (SWM) — V0
 
 **Research question:** Can replacing LeWM's Euclidean representations + SIGReg with spherical representations + a uniformity-oriented anti-collapse loss improve performance, particularly on Two-Room (where LeWM scores 87% vs. 100% for simpler baselines)?

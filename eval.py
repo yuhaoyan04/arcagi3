@@ -14,6 +14,7 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+
 def img_transform(cfg):
     transform = transforms.Compose(
         [
@@ -45,6 +46,7 @@ def get_dataset(cfg, dataset_name):
         cache_dir=dataset_path,
     )
     return dataset
+
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -149,7 +151,7 @@ def run(cfg: DictConfig):
         video_path=results_path,
     )
     end_time = time.time()
-    
+
     print(metrics)
 
     results_path = results_path / cfg.output.filename

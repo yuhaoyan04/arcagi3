@@ -8,6 +8,7 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
+
 try:
     from swanlab.integration.pytorch_lightning import SwanLabLogger
 except ImportError:
@@ -16,7 +17,14 @@ from omegaconf import OmegaConf, open_dict
 from torch import nn
 
 from jepa import SphericalJEPA
-from module import ARPredictor, Embedder, cosine_pred_loss, infonce_loss, spread_loss, uniformity_loss
+from module import (
+    ARPredictor,
+    Embedder,
+    cosine_pred_loss,
+    infonce_loss,
+    spread_loss,
+    uniformity_loss,
+)
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -26,7 +34,9 @@ def build_projection_head(input_dim: int, output_dim: int, head_type: str) -> nn
     if head_type == "ln":
         return nn.Sequential(nn.Linear(input_dim, output_dim), nn.LayerNorm(output_dim))
     if head_type == "bn":
-        return nn.Sequential(nn.Linear(input_dim, output_dim), nn.BatchNorm1d(output_dim))
+        return nn.Sequential(
+            nn.Linear(input_dim, output_dim), nn.BatchNorm1d(output_dim)
+        )
     raise ValueError(f"Unsupported projection_head.type: {head_type}")
 
 
@@ -48,14 +58,14 @@ def swm_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)  # emb is already L2-normalised on sphere
 
-    emb = output["emb"]       # (B, T, D), unit vectors
+    emb = output["emb"]  # (B, T, D), unit vectors
     act_emb = output["act_emb"]
 
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
 
-    tgt_emb = emb[:, n_preds:]                         # ground-truth next embeddings
-    pred_emb = self.model.predict(ctx_emb, ctx_act)    # predicted, also on sphere
+    tgt_emb = emb[:, n_preds:]  # ground-truth next embeddings
+    pred_emb = self.model.predict(ctx_emb, ctx_act)  # predicted, also on sphere
 
     output["pred_loss"] = cosine_pred_loss(pred_emb, tgt_emb)
     if reg_type == "spread":
@@ -84,7 +94,9 @@ def run(cfg):
     #########################
 
     dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
+    transforms = [
+        get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)
+    ]
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
@@ -107,7 +119,9 @@ def run(cfg):
     train = torch.utils.data.DataLoader(
         train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
     )
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    val = torch.utils.data.DataLoader(
+        val_set, **cfg.loader, shuffle=False, drop_last=False
+    )
 
     ##############################
     ##       model / optim      ##
@@ -186,7 +200,9 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = ModelObjectCallBack(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
+        dirpath=run_dir,
+        filename=cfg.output_model_name,
+        epoch_interval=1,
     )
 
     trainer = pl.Trainer(

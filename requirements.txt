@@ -1,0 +1,8 @@
+# Base training/eval stack used by this repo.
+stable-worldmodel[train,env]
+
+# Direct imports used by wm_exp scripts.
+scikit-learn
+umap-learn
+matplotlib
+swanlab

@@ -4,6 +4,7 @@ from pathlib import Path
 from stable_pretraining import data as dt
 from lightning.pytorch.callbacks import Callback
 
+
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
     to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
@@ -24,6 +25,7 @@ def get_column_normalizer(dataset, source: str, target: str):
 
     normalizer = dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
     return normalizer
+
 
 class ModelObjectCallBack(Callback):
     """Callback to pickle model object after each epoch."""

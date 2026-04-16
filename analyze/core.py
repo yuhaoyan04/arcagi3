@@ -11,7 +11,9 @@ from omegaconf import OmegaConf
 def resolve_checkpoint_path(checkpoint: str, cache_dir: str | None = None) -> Path:
     path = Path(checkpoint)
     if not path.exists():
-        root = Path(cache_dir) if cache_dir is not None else swm.data.utils.get_cache_dir()
+        root = (
+            Path(cache_dir) if cache_dir is not None else swm.data.utils.get_cache_dir()
+        )
         path = Path(root, checkpoint)
 
     if path.is_dir():
@@ -91,7 +93,9 @@ def collect_embeddings(model, loader, target_keys, frame_index, max_samples, dev
                 available_keys = set(batch.keys())
                 missing = [key for key in target_keys if key not in available_keys]
                 if missing:
-                    raise KeyError(f"Requested target keys missing from dataset batch: {missing}")
+                    raise KeyError(
+                        f"Requested target keys missing from dataset batch: {missing}"
+                    )
 
             batch_size = batch["pixels"].shape[0]
             remaining = None if max_samples is None else max_samples - seen
@@ -106,7 +110,9 @@ def collect_embeddings(model, loader, target_keys, frame_index, max_samples, dev
 
             sequence_len = batch["pixels"].shape[1]
             for key in target_keys:
-                targets[key].append(slice_frame(batch[key][:take], frame_index, sequence_len))
+                targets[key].append(
+                    slice_frame(batch[key][:take], frame_index, sequence_len)
+                )
 
             seen += take
 
@@ -162,7 +168,9 @@ def maybe_import_umap():
     return umap
 
 
-def write_embedding_dump(path: Path, embeddings: np.ndarray, targets: dict[str, np.ndarray]):
+def write_embedding_dump(
+    path: Path, embeddings: np.ndarray, targets: dict[str, np.ndarray]
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, embeddings=embeddings, **targets)
 
@@ -175,7 +183,16 @@ def _flatten_columns(name: str, value: np.ndarray):
     return {f"{name}_{i}": flat[:, i] for i in range(flat.shape[1])}
 
 
-def _save_projection(prefix: str, coords: np.ndarray, targets: dict[str, np.ndarray], output_dir: Path):
+def _save_projection(
+    prefix: str,
+    coords: np.ndarray,
+    targets: dict[str, np.ndarray],
+    output_dir: Path,
+    save_intermediate: bool,
+):
+    if not save_intermediate:
+        return None
+
     np.savez(output_dir / f"{prefix}.npz", coords=coords, **targets)
 
     columns = {f"{prefix}_{i}": coords[:, i] for i in range(coords.shape[1])}
@@ -200,24 +217,41 @@ def _maybe_plot_projection(
     color_by: str | None,
     output_dir: Path,
 ):
-    if not color_by or color_by not in targets:
-        return None
-
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return None
 
-    color = np.asarray(targets[color_by])
-    if color.ndim > 1:
-        color = color.reshape(color.shape[0], -1)[:, 0]
+    color = None
+    title = prefix.replace("_", " ")
+    if color_by and color_by in targets:
+        color = np.asarray(targets[color_by])
+        if color.ndim > 1:
+            color = color.reshape(color.shape[0], -1)[:, 0]
+        title = f"{title} | color={color_by}"
 
     plot_path = output_dir / f"{prefix}.png"
     if coords.shape[1] >= 3:
         fig = plt.figure(figsize=(7, 7))
         ax = fig.add_subplot(111, projection="3d")
-        sc = ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=color, s=5, cmap="viridis")
-        fig.colorbar(sc)
+        if color is None:
+            ax.scatter(
+                coords[:, 0],
+                coords[:, 1],
+                coords[:, 2],
+                s=6,
+                alpha=0.8,
+                color="tab:blue",
+            )
+        else:
+            sc = ax.scatter(
+                coords[:, 0], coords[:, 1], coords[:, 2], c=color, s=6, cmap="viridis"
+            )
+            fig.colorbar(sc, shrink=0.75)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.set_title(title)
         plt.tight_layout()
         plt.savefig(plot_path, dpi=200)
         plt.close(fig)
@@ -225,8 +259,14 @@ def _maybe_plot_projection(
 
     if coords.shape[1] >= 2:
         plt.figure(figsize=(6, 6))
-        plt.scatter(coords[:, 0], coords[:, 1], c=color, s=5, cmap="viridis")
-        plt.colorbar()
+        if color is None:
+            plt.scatter(coords[:, 0], coords[:, 1], s=6, alpha=0.8, color="tab:blue")
+        else:
+            plt.scatter(coords[:, 0], coords[:, 1], c=color, s=6, cmap="viridis")
+            plt.colorbar()
+        plt.xlabel("dim 1")
+        plt.ylabel("dim 2")
+        plt.title(title)
         plt.tight_layout()
         plt.savefig(plot_path, dpi=200)
         plt.close()
@@ -235,7 +275,14 @@ def _maybe_plot_projection(
     return None
 
 
-def run_tsne(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int, output_dir: Path):
+def run_tsne(
+    embeddings: np.ndarray,
+    targets: dict[str, np.ndarray],
+    cfg,
+    seed: int,
+    output_dir: Path,
+    save_intermediate: bool,
+):
     sk = maybe_import_sklearn()
     n_samples = embeddings.shape[0]
     if n_samples < 2:
@@ -251,12 +298,25 @@ def run_tsne(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: 
         random_state=seed,
     )
     coords = tsne.fit_transform(embeddings)
-    csv_path = _save_projection("tsne", coords, targets, output_dir)
-    plot_path = _maybe_plot_projection("tsne", coords, targets, cfg.get("color_by"), output_dir)
-    return {"perplexity": perplexity, "csv": str(csv_path), "plot": plot_path}
+    csv_path = _save_projection("tsne", coords, targets, output_dir, save_intermediate)
+    plot_path = _maybe_plot_projection(
+        "tsne", coords, targets, cfg.get("color_by"), output_dir
+    )
+    return {
+        "perplexity": perplexity,
+        "csv": str(csv_path) if csv_path is not None else None,
+        "plot": plot_path,
+    }
 
 
-def run_umap(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int, output_dir: Path):
+def run_umap(
+    embeddings: np.ndarray,
+    targets: dict[str, np.ndarray],
+    cfg,
+    seed: int,
+    output_dir: Path,
+    save_intermediate: bool,
+):
     if embeddings.shape[0] < 2:
         raise ValueError("UMAP requires at least 2 samples")
 
@@ -274,13 +334,24 @@ def run_umap(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: 
         random_state=seed,
     )
     coords = reducer.fit_transform(embeddings)
-    csv_path = _save_projection("umap", coords, targets, output_dir)
-    plot_path = _maybe_plot_projection("umap", coords, targets, cfg.get("color_by"), output_dir)
-    return {"n_neighbors": n_neighbors, "csv": str(csv_path), "plot": plot_path}
+    csv_path = _save_projection("umap", coords, targets, output_dir, save_intermediate)
+    plot_path = _maybe_plot_projection(
+        "umap", coords, targets, cfg.get("color_by"), output_dir
+    )
+    return {
+        "n_neighbors": n_neighbors,
+        "csv": str(csv_path) if csv_path is not None else None,
+        "plot": plot_path,
+    }
 
 
 def run_spherical_tsne(
-    embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int, output_dir: Path
+    embeddings: np.ndarray,
+    targets: dict[str, np.ndarray],
+    cfg,
+    seed: int,
+    output_dir: Path,
+    save_intermediate: bool,
 ):
     sk = maybe_import_sklearn()
     n_samples = embeddings.shape[0]
@@ -303,11 +374,17 @@ def run_spherical_tsne(
     norms = np.linalg.norm(coords, axis=1, keepdims=True)
     coords = coords / np.clip(norms, a_min=1e-12, a_max=None)
 
-    csv_path = _save_projection("spherical_tsne", coords, targets, output_dir)
+    csv_path = _save_projection(
+        "spherical_tsne", coords, targets, output_dir, save_intermediate
+    )
     plot_path = _maybe_plot_projection(
         "spherical_tsne", coords, targets, cfg.get("color_by"), output_dir
     )
-    return {"perplexity": perplexity, "csv": str(csv_path), "plot": plot_path}
+    return {
+        "perplexity": perplexity,
+        "csv": str(csv_path) if csv_path is not None else None,
+        "plot": plot_path,
+    }
 
 
 def infer_probe_task(y: np.ndarray, max_classes: int) -> str:
@@ -320,7 +397,9 @@ def infer_probe_task(y: np.ndarray, max_classes: int) -> str:
     return "regression"
 
 
-def run_linear_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int):
+def run_linear_probes(
+    embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int
+):
     sk = maybe_import_sklearn()
     print(f"[analyze] Running linear probes: targets={list(cfg.target_keys)}")
     results = {}
@@ -363,7 +442,9 @@ def run_linear_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cf
     return results
 
 
-def run_mlp_probes(embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int):
+def run_mlp_probes(
+    embeddings: np.ndarray, targets: dict[str, np.ndarray], cfg, seed: int
+):
     sk = maybe_import_sklearn()
     print(
         f"[analyze] Running MLP probes: targets={list(cfg.target_keys)}, "

@@ -57,7 +57,8 @@ def run(cfg: DictConfig):
         device=cfg.device,
     )
 
-    write_embedding_dump(output_dir / "embeddings.npz", embeddings, targets)
+    if cfg.output.save_intermediate:
+        write_embedding_dump(output_dir / "embeddings.npz", embeddings, targets)
 
     tsne_results = None
     if cfg.analysis.tsne.enabled:
@@ -67,6 +68,7 @@ def run(cfg: DictConfig):
             cfg=cfg.analysis.tsne,
             seed=cfg.seed,
             output_dir=output_dir,
+            save_intermediate=cfg.output.save_intermediate,
         )
 
     umap_results = None
@@ -77,6 +79,7 @@ def run(cfg: DictConfig):
             cfg=cfg.analysis.umap,
             seed=cfg.seed,
             output_dir=output_dir,
+            save_intermediate=cfg.output.save_intermediate,
         )
 
     spherical_tsne_results = None
@@ -87,6 +90,7 @@ def run(cfg: DictConfig):
             cfg=cfg.analysis.spherical_tsne,
             seed=cfg.seed,
             output_dir=output_dir,
+            save_intermediate=cfg.output.save_intermediate,
         )
 
     linear_probe_results = None

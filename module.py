@@ -3,9 +3,11 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 
+
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
     return x * (1 + scale) + shift
+
 
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
@@ -33,8 +35,9 @@ class SIGReg(torch.nn.Module):
         x_t = (proj @ A).unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
-        return statistic.mean() # average over projections and time
-    
+        return statistic.mean()  # average over projections and time
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
@@ -186,6 +189,7 @@ class Transformer(nn.Module):
             x = self.output_proj(x)
         return x
 
+
 class Embedder(nn.Module):
     def __init__(
         self,
@@ -266,7 +270,7 @@ def spread_loss(emb: torch.Tensor, margin: float) -> torch.Tensor:
     configured margin.
     """
     z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
-    sim = z @ z.T                      # (B*T, B*T)
+    sim = z @ z.T  # (B*T, B*T)
     return torch.clamp_min(_pairwise_offdiag(sim) - margin, 0.0).square().mean()
 
 
@@ -296,7 +300,9 @@ def infonce_loss(emb: torch.Tensor, temperature: float) -> torch.Tensor:
         return z.new_tensor(0.0)
 
     logits = (z @ z.T) / temperature
-    logits = logits.masked_fill(torch.eye(n, dtype=torch.bool, device=z.device), float("-inf"))
+    logits = logits.masked_fill(
+        torch.eye(n, dtype=torch.bool, device=z.device), float("-inf")
+    )
     log_denom = torch.logsumexp(logits, dim=-1)
     return (-1.0 + log_denom).mean()
 
