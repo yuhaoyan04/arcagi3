@@ -36,17 +36,19 @@ Dependencies: `stable-pretraining`, `stable-worldmodel`. Training uses PyTorch L
 
 10. Add visibility when an operation may take noticeable time.
 
-11. Run `ruff format` after edits.
-
 ### Maintenance
 
-12. Update `AGENTS.md` only when a new rule is necessary and keep the rule general.
+11. Update `AGENTS.md` only when a new rule is necessary and keep the rule general.
 
 ### Commits
 
-13. Write concise and informative git commit messages.
+12. Write concise and informative git commit messages.
 
-14. Use bulleted detail lines in commit messages when needed.
+13. Use bulleted detail lines in commit messages when needed.
+
+### Communication
+
+14. Reply to the user in Chinese, but keep technical terms in English.
 
 ## Experiment: Spherical World Model (SWM) — V0
 

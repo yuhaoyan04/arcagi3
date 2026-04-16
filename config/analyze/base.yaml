@@ -23,14 +23,14 @@ analysis:
     learning_rate: auto
     color_by: null
   umap:
-    enabled: false
+    enabled: true
     n_components: 2
     n_neighbors: 15
     min_dist: 0.1
     metric: euclidean
     color_by: null
   spherical_tsne:
-    enabled: false
+    enabled: true
     perplexity: 30.0
     init: pca
     learning_rate: auto

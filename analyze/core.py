@@ -68,6 +68,18 @@ def to_numpy(value):
     return np.asarray(value)
 
 
+def summarize_array(value: np.ndarray) -> dict:
+    value = np.asarray(value)
+    flat = value.reshape(value.shape[0], -1) if value.ndim > 1 else value.reshape(-1, 1)
+    return {
+        "shape": list(value.shape),
+        "mean": flat.mean(axis=0).tolist(),
+        "std": flat.std(axis=0).tolist(),
+        "min": flat.min(axis=0).tolist(),
+        "max": flat.max(axis=0).tolist(),
+    }
+
+
 def slice_frame(value, frame_index: int, sequence_len: int):
     value_np = to_numpy(value)
     if value_np.ndim >= 2 and value_np.shape[1] == sequence_len:
@@ -508,6 +520,8 @@ def save_results(
     output_dir: Path,
     cfg,
     checkpoint_path: Path,
+    embeddings: np.ndarray,
+    targets: dict[str, np.ndarray],
     linear_probe_results,
     mlp_probe_results,
     tsne_results,
@@ -516,10 +530,21 @@ def save_results(
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[analyze] Saving analysis outputs to: {output_dir}")
+    print(
+        f"[analyze] Summary stats: n_samples={embeddings.shape[0]}, "
+        f"embedding_dim={embeddings.shape[1]}, targets={list(targets.keys())}"
+    )
     with (output_dir / "summary.json").open("w") as f:
         json.dump(
             {
                 "checkpoint": str(checkpoint_path),
+                "dataset_stats": {
+                    "num_samples": int(embeddings.shape[0]),
+                    "embedding_dim": int(embeddings.shape[1]),
+                    "targets": {
+                        key: summarize_array(value) for key, value in targets.items()
+                    },
+                },
                 "linear_probe_results": linear_probe_results,
                 "mlp_probe_results": mlp_probe_results,
                 "tsne": tsne_results,

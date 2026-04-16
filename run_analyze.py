@@ -115,6 +115,8 @@ def run(cfg: DictConfig):
         output_dir,
         cfg,
         checkpoint_path,
+        embeddings,
+        targets,
         linear_probe_results,
         mlp_probe_results,
         tsne_results,
