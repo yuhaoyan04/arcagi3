@@ -158,22 +158,31 @@ class SphericalJEPA(JEPA):
     """JEPA with L2-normalised (spherical) representations.
 
     Identical to JEPA except:
-    - encode() projects embeddings onto S^{d-1} after the projector.
-    - predict() projects predicted embeddings onto S^{d-1} after pred_proj.
+    - encode() exposes both pre-norm embeddings (`emb_raw`) and their
+      L2-normalised version on S^{d-1} (`emb`).
+    - predict_raw() returns pre-norm predictor outputs after `pred_proj`.
+    - predict() returns the L2-normalised version of `predict_raw()`.
     - criterion() uses cosine distance instead of MSE for planning cost.
 
     rollout() and get_cost() are inherited unchanged — they call self.encode,
     self.predict, and self.criterion, which are all overridden here.
     """
 
+    def normalize_embeddings(self, emb):
+        return F.normalize(emb, dim=-1, eps=1e-8)
+
     def encode(self, info):
         info = super().encode(info)
-        info["emb"] = F.normalize(info["emb"], dim=-1, eps=1e-8)
+        info["emb_raw"] = info["emb"]
+        info["emb"] = self.normalize_embeddings(info["emb_raw"])
         return info
 
+    def predict_raw(self, emb, act_emb):
+        return super().predict(emb, act_emb)
+
     def predict(self, emb, act_emb):
-        preds = super().predict(emb, act_emb)
-        return F.normalize(preds, dim=-1, eps=1e-8)
+        preds = self.predict_raw(emb, act_emb)
+        return self.normalize_embeddings(preds)
 
     def criterion(self, info_dict: dict):
         """Cosine distance planning cost (replaces MSE).
