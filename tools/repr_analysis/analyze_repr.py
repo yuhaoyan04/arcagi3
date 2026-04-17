@@ -1,0 +1,628 @@
+"""
+analyze_repr.py - Representation analysis for LeWM / SWM checkpoints.
+
+This script is designed to answer one question before changing losses again:
+"What is wrong (or right) about the representation?"
+
+It focuses on four analysis blocks:
+1. embedding      - anti-collapse / distribution health
+2. topology       - does latent geometry preserve state-space geometry
+3. dynamics       - does latent motion track true state motion
+4. action_effect  - does changing action create meaningful latent branching
+
+Typical usage:
+
+  python analyze_repr.py \
+      --ckpt /path/to/model_object.pt \
+      --dataset tworoom \
+      --state-key proprio \
+      --save-dir /tmp/repr_analysis_tworoom
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+import torch.nn.functional as F
+
+import stable_pretraining as spt
+import stable_worldmodel as swm
+
+from utils import get_column_normalizer, get_img_preprocessor
+
+
+def load_model(ckpt_path: str, device: str = "cpu"):
+    """Load an object checkpoint saved by ModelObjectCallBack."""
+    model = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if hasattr(model, "model"):
+        model = model.model
+    return model.to(device).eval().requires_grad_(False)
+
+
+def infer_history_size(model) -> int:
+    predictor = getattr(model, "predictor", None)
+    if predictor is None or not hasattr(predictor, "pos_embedding"):
+        raise ValueError("Unable to infer history_size from model.predictor.pos_embedding")
+    return int(predictor.pos_embedding.shape[1])
+
+
+def load_dataset_samples(
+    *,
+    dataset_name: str,
+    state_key: str,
+    n_sequences: int,
+    history_size: int,
+    frameskip: int,
+    img_size: int,
+    seed: int,
+    device: str,
+):
+    """Load a random subset of sequences with the same preprocessing as training."""
+    num_steps = history_size + 1
+    ds = swm.data.HDF5Dataset(
+        name=dataset_name,
+        num_steps=num_steps,
+        frameskip=frameskip,
+        keys_to_load=["pixels", "action", state_key],
+        transform=None,
+    )
+    ds.transform = spt.data.transforms.Compose(
+        get_img_preprocessor("pixels", "pixels", img_size),
+        get_column_normalizer(ds, "action", "action"),
+        get_column_normalizer(ds, state_key, state_key),
+    )
+
+    g = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(ds), generator=g)[:n_sequences].tolist()
+    samples = [ds[i] for i in indices]
+
+    batch = {
+        "pixels": torch.stack([s["pixels"] for s in samples]).to(device),
+        "action": torch.nan_to_num(torch.stack([s["action"] for s in samples]), 0.0).to(device),
+        "state": torch.stack([s[state_key] for s in samples]).to(device),
+    }
+    return batch
+
+
+@torch.no_grad()
+def encode_sequences(model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Encode sequences and compute one-step predictions."""
+    info = model.encode({"pixels": batch["pixels"], "action": batch["action"]})
+    emb = info["emb"]
+    act_emb = info["act_emb"]
+
+    ctx_len = infer_history_size(model)
+    pred = model.predict(emb[:, :ctx_len], act_emb[:, :ctx_len])
+    tgt = emb[:, 1:]
+
+    return {
+        "emb": emb,
+        "pred": pred,
+        "tgt": tgt,
+        "action": batch["action"],
+        "state": batch["state"],
+    }
+
+
+def exclude_diagonal(mat: torch.Tensor) -> torch.Tensor:
+    n = mat.size(0)
+    mask = ~torch.eye(n, dtype=torch.bool, device=mat.device)
+    return mat[mask]
+
+
+def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    x = x.float().reshape(-1)
+    y = y.float().reshape(-1)
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = x.norm() * y.norm()
+    if float(denom) < 1e-12:
+        return 0.0
+    return float((x @ y) / denom)
+
+
+def effective_rank(z: torch.Tensor) -> float:
+    """Entropy-based effective rank of the centered embedding matrix."""
+    z = z - z.mean(0, keepdim=True)
+    singular_values = torch.linalg.svdvals(z)
+    power = singular_values.square()
+    total = power.sum()
+    if float(total) < 1e-12:
+        return 0.0
+    p = power / total
+    entropy = -(p * torch.log(p.clamp_min(1e-12))).sum()
+    return float(torch.exp(entropy))
+
+
+def pca_projection(z: torch.Tensor, out_dim: int = 2) -> torch.Tensor:
+    z = z - z.mean(0, keepdim=True)
+    q = min(max(out_dim, 2), z.shape[1], z.shape[0] - 1)
+    u, s, _ = torch.pca_lowrank(z, q=q)
+    return u[:, :out_dim] * s[:out_dim]
+
+
+def tsne_projection(
+    z: torch.Tensor,
+    *,
+    out_dim: int = 2,
+    perplexity: float = 30.0,
+    random_state: int = 3072,
+    pca_dim: int = 32,
+) -> torch.Tensor:
+    """Optional t-SNE projection for visual inspection of local neighborhoods.
+
+    This is intentionally separate from the quantitative analysis because t-SNE
+    is useful for visualising local structure, but not reliable for judging
+    global geometry.
+    """
+    try:
+        from sklearn.manifold import TSNE
+    except ImportError as exc:
+        raise ImportError(
+            "t-SNE requires scikit-learn. Install it with `pip install scikit-learn`."
+        ) from exc
+
+    z = z.cpu()
+    n = z.shape[0]
+    if n < 3:
+        raise ValueError("Need at least 3 points for t-SNE projection.")
+
+    max_perplexity = max(1.0, float((n - 1) // 3))
+    perplexity = min(perplexity, max_perplexity)
+    if pca_dim and z.shape[1] > pca_dim:
+        z = pca_projection(z, out_dim=min(pca_dim, z.shape[1]))
+
+    tsne = TSNE(
+        n_components=out_dim,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        random_state=random_state,
+    )
+    proj = tsne.fit_transform(z.numpy())
+    return torch.from_numpy(proj)
+
+
+def knn_overlap(a_dist: torch.Tensor, b_dist: torch.Tensor, k: int) -> float:
+    """Average neighbor overlap between two distance matrices."""
+    n = a_dist.size(0)
+    a = a_dist.clone()
+    b = b_dist.clone()
+    eye = torch.eye(n, dtype=torch.bool, device=a.device)
+    a[eye] = float("inf")
+    b[eye] = float("inf")
+    a_idx = torch.topk(a, k=k, largest=False).indices
+    b_idx = torch.topk(b, k=k, largest=False).indices
+
+    overlaps = []
+    for i in range(n):
+        overlaps.append(len(set(a_idx[i].tolist()) & set(b_idx[i].tolist())) / float(k))
+    return float(sum(overlaps) / len(overlaps))
+
+
+def analyze_embedding(z: torch.Tensor) -> Dict[str, float]:
+    flat = z.reshape(-1, z.size(-1)).cpu()
+    norms = flat.norm(dim=-1)
+    cos = F.normalize(flat, dim=-1) @ F.normalize(flat, dim=-1).T
+    dim_std = flat.std(dim=0)
+    return {
+        "n_embeddings": int(flat.shape[0]),
+        "dim": int(flat.shape[1]),
+        "norm_mean": float(norms.mean()),
+        "norm_std": float(norms.std()),
+        "dim_std_mean": float(dim_std.mean()),
+        "dim_std_min": float(dim_std.min()),
+        "dim_std_max": float(dim_std.max()),
+        "inter_sample_cosine_mean": float(exclude_diagonal(cos).mean()),
+        "inter_sample_cosine_std": float(exclude_diagonal(cos).std()),
+        "effective_rank": effective_rank(flat),
+    }
+
+
+def analyze_topology(z: torch.Tensor, state: torch.Tensor, k: int, max_points: int) -> Dict[str, float]:
+    flat_z = z.reshape(-1, z.size(-1)).cpu()
+    flat_s = state.reshape(-1, state.size(-1)).cpu()
+    n = min(max_points, flat_z.shape[0])
+    flat_z = flat_z[:n]
+    flat_s = flat_s[:n]
+
+    flat_s = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
+
+    z_dist = torch.cdist(flat_z, flat_z)
+    s_dist = torch.cdist(flat_s, flat_s)
+
+    return {
+        "n_points": int(n),
+        "k": int(k),
+        "distance_corr": pearson_corr(exclude_diagonal(z_dist), exclude_diagonal(s_dist)),
+        "knn_overlap": knn_overlap(z_dist, s_dist, k=min(k, n - 1)),
+    }
+
+
+def analyze_dynamics(z: torch.Tensor, state: torch.Tensor, pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
+    z_now = z[:, :-1]
+    z_next = z[:, 1:]
+    s_now = state[:, :-1]
+    s_next = state[:, 1:]
+
+    latent_step = (z_next - z_now).norm(dim=-1).reshape(-1).cpu()
+    state_step = (s_next - s_now).norm(dim=-1).reshape(-1).cpu()
+    pred_err = (pred - tgt).norm(dim=-1).reshape(-1).cpu()
+
+    pred_flat = pred.reshape(-1, pred.size(-1))
+    tgt_flat = tgt.reshape(-1, tgt.size(-1))
+    pred_cos = F.cosine_similarity(pred_flat, tgt_flat, dim=-1).cpu()
+    pred_cos_dist = (1.0 - pred_cos).cpu()
+
+    return {
+        "latent_step_mean": float(latent_step.mean()),
+        "latent_step_std": float(latent_step.std()),
+        "state_step_mean": float(state_step.mean()),
+        "state_step_std": float(state_step.std()),
+        "latent_state_step_corr": pearson_corr(latent_step, state_step),
+        "pred_error_mean": float(pred_err.mean()),
+        "pred_error_std": float(pred_err.std()),
+        "pred_target_cosine_mean": float(pred_cos.mean()),
+        "pred_target_cosine_std": float(pred_cos.std()),
+        "pred_target_cosine_distance_mean": float(pred_cos_dist.mean()),
+    }
+
+
+@torch.no_grad()
+def analyze_action_effect(
+    model,
+    z: torch.Tensor,
+    action: torch.Tensor,
+    *,
+    n_trials: int,
+    interp_steps: int,
+    perturb_scale: float,
+) -> Dict[str, float]:
+    ctx_len = infer_history_size(model)
+    ctx_emb = z[:, :ctx_len]
+    base_action = action[:, :ctx_len].clone()
+    base_pred = model.predict(ctx_emb, model.action_encoder(base_action))[:, -1]
+
+    action_std = action.reshape(-1, action.size(-1)).std(dim=0).clamp_min(1e-6)
+
+    perturb_norms = []
+    pred_shift_norms = []
+    for _ in range(n_trials):
+        delta = torch.randn_like(base_action[:, -1]) * action_std * perturb_scale
+        perturbed = base_action.clone()
+        perturbed[:, -1] = perturbed[:, -1] + delta
+        pred = model.predict(ctx_emb, model.action_encoder(perturbed))[:, -1]
+
+        perturb_norms.append(delta.norm(dim=-1).mean())
+        pred_shift_norms.append((pred - base_pred).norm(dim=-1).mean())
+
+    perturb_norms = torch.stack(perturb_norms).cpu()
+    pred_shift_norms = torch.stack(pred_shift_norms).cpu()
+
+    action_a = base_action[:1].clone()
+    action_b = base_action[:1].clone()
+    action_b[:, -1] = action_b[:, -1] + action_std.unsqueeze(0) * perturb_scale
+    alphas = torch.linspace(0, 1, interp_steps, device=base_action.device)
+
+    interp_preds: List[torch.Tensor] = []
+    single_ctx = ctx_emb[:1]
+    for alpha in alphas:
+        act = (1 - alpha) * action_a + alpha * action_b
+        pred = model.predict(single_ctx, model.action_encoder(act))[:, -1]
+        interp_preds.append(pred.squeeze(0))
+
+    interp_preds = torch.stack(interp_preds)
+    interp_dist = (interp_preds - interp_preds[0]).norm(dim=-1).cpu()
+    monotonicity = float(((interp_dist[1:] - interp_dist[:-1]) >= 0).float().mean())
+
+    return {
+        "n_trials": int(n_trials),
+        "perturb_scale": float(perturb_scale),
+        "mean_action_perturb_norm": float(perturb_norms.mean()),
+        "mean_pred_shift_norm": float(pred_shift_norms.mean()),
+        "action_perturb_pred_shift_corr": pearson_corr(perturb_norms, pred_shift_norms),
+        "interpolation_endpoint_shift": float(interp_dist[-1]),
+        "interpolation_monotonicity": monotonicity,
+    }
+
+
+def build_local_neighbor_report(
+    z: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    k: int,
+    n_anchors: int,
+) -> List[Dict]:
+    """Compare local neighborhoods in latent space and state space."""
+    flat_z = z.reshape(-1, z.size(-1)).cpu()
+    flat_s = state.reshape(-1, state.size(-1)).cpu()
+    n = flat_z.shape[0]
+    seq_len = state.size(1)
+
+    z_dist = torch.cdist(flat_z, flat_z)
+    s_norm = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
+    s_dist = torch.cdist(s_norm, s_norm)
+
+    eye = torch.eye(n, dtype=torch.bool)
+    z_dist[eye] = float("inf")
+    s_dist[eye] = float("inf")
+
+    anchors = torch.linspace(0, n - 1, steps=min(n_anchors, n)).long().unique()
+    report = []
+    for anchor in anchors.tolist():
+        z_nn = torch.topk(z_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
+        s_nn = torch.topk(s_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
+        item = {
+            "anchor_index": anchor,
+            "anchor_seq_id": anchor // seq_len,
+            "anchor_time_id": anchor % seq_len,
+            "anchor_state": flat_s[anchor].tolist(),
+            "overlap": len(set(z_nn) & set(s_nn)) / float(min(k, n - 1)),
+            "latent_nn": [],
+            "state_nn": [],
+        }
+        for idx in z_nn:
+            item["latent_nn"].append({
+                "index": idx,
+                "seq_id": idx // seq_len,
+                "time_id": idx % seq_len,
+                "latent_distance": float(z_dist[anchor, idx]),
+                "state_distance": float(s_dist[anchor, idx]),
+                "state": flat_s[idx].tolist(),
+            })
+        for idx in s_nn:
+            item["state_nn"].append({
+                "index": idx,
+                "seq_id": idx // seq_len,
+                "time_id": idx % seq_len,
+                "latent_distance": float(z_dist[anchor, idx]),
+                "state_distance": float(s_dist[anchor, idx]),
+                "state": flat_s[idx].tolist(),
+            })
+        report.append(item)
+    return report
+
+
+def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> List[str]:
+    """Environment-aware interpretation hints."""
+    dataset_l = dataset.lower()
+    emb = result["embedding"]
+    topo = result["topology"]
+    dyn = result["dynamics"]
+    act = result["action_effect"]
+
+    hints: List[str] = []
+
+    if emb["effective_rank"] < 4:
+        hints.append("Embedding rank is very low; the representation may still be partially collapsed.")
+    elif emb["effective_rank"] < 12:
+        hints.append("Embedding rank is moderate; anti-collapse works, but capacity usage may still be limited.")
+    else:
+        hints.append("Embedding rank looks healthy; remaining issues likely come from geometry or dynamics rather than collapse.")
+
+    if topo["distance_corr"] < 0.2:
+        hints.append("Latent distances do not track state distances well; geometry is a likely bottleneck.")
+    elif topo["distance_corr"] < 0.5:
+        hints.append("Latent geometry partially tracks state geometry, but there is still clear distortion.")
+    else:
+        hints.append("Latent geometry tracks state geometry reasonably well.")
+
+    if topo["knn_overlap"] < 0.2:
+        hints.append("Local neighborhoods disagree strongly between latent and state spaces.")
+    elif topo["knn_overlap"] > 0.5:
+        hints.append("Local neighborhoods are preserved fairly well.")
+
+    if dyn["latent_state_step_corr"] < 0.2:
+        hints.append("Latent motion is weakly aligned with true state motion; predictor/action conditioning is a good next target.")
+    elif dyn["latent_state_step_corr"] > 0.5:
+        hints.append("Latent motion is fairly well aligned with true state motion.")
+
+    if act["action_perturb_pred_shift_corr"] < 0.2:
+        hints.append("Action perturbations do not produce structured latent branching; action usage may be weak.")
+    elif act["action_perturb_pred_shift_corr"] > 0.5:
+        hints.append("Action perturbations produce structured latent branching.")
+
+    if act["interpolation_monotonicity"] < 0.75:
+        hints.append("Action interpolation is not very smooth; local latent dynamics may be jagged.")
+
+    if "tworoom" in dataset_l:
+        hints.append("For TwoRoom, inspect whether door-adjacent states remain connected instead of splitting into disconnected islands.")
+    elif "pusht" in dataset_l:
+        hints.append("For PushT, inspect whether agent/block position changes form a smooth sheet instead of fragmented clusters.")
+    elif "cube" in dataset_l or "ogb" in dataset_l:
+        hints.append("For Cube, inspect whether contact transitions bend the manifold smoothly instead of tearing local neighborhoods.")
+    elif "reacher" in dataset_l or "dmc" in dataset_l:
+        hints.append("For Reacher, inspect whether continuous arm poses remain continuous in the latent projection.")
+
+    return hints
+
+
+def to_serializable(obj):
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().tolist()
+    return obj
+
+
+def print_section(title: str, metrics: Dict[str, float]):
+    print(f"\n{'=' * 72}")
+    print(title)
+    print(f"{'=' * 72}")
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.6f}")
+        else:
+            print(f"{key}: {value}")
+
+
+def print_hints(hints: List[str]):
+    print(f"\n{'=' * 72}")
+    print("Interpretation")
+    print(f"{'=' * 72}")
+    for hint in hints:
+        print(f"- {hint}")
+
+
+def save_projection_rows(proj: torch.Tensor, state: torch.Tensor, save_path: Path):
+    flat_s = state.reshape(-1, state.size(-1)).cpu()
+    rows = []
+    seq_len = state.size(1)
+    for idx in range(proj.size(0)):
+        seq_id = idx // seq_len
+        time_id = idx % seq_len
+        row = {
+            "seq_id": seq_id,
+            "time_id": time_id,
+            "x": float(proj[idx, 0]),
+            "y": float(proj[idx, 1]),
+        }
+        for dim in range(flat_s.size(1)):
+            row[f"state_{dim}"] = float(flat_s[idx, dim])
+        rows.append(row)
+
+    with open(save_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+
+def save_outputs(
+    save_dir: Path,
+    result: Dict[str, Dict[str, float]],
+    z: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    export_tsne: bool,
+    tsne_perplexity: float,
+    seed: int,
+):
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(save_dir / "summary.json", "w") as f:
+        json.dump(to_serializable(result), f, indent=2)
+
+    flat_z = z.reshape(-1, z.size(-1)).cpu()
+    pca_proj = pca_projection(flat_z, out_dim=2)
+    save_projection_rows(pca_proj, state, save_dir / "pca_projection.json")
+
+    if export_tsne:
+        try:
+            tsne_proj = tsne_projection(
+                flat_z,
+                out_dim=2,
+                perplexity=tsne_perplexity,
+                random_state=seed,
+            )
+            save_projection_rows(tsne_proj, state, save_dir / "tsne_projection.json")
+            result.setdefault("visualization", {})["tsne_exported"] = True
+            result["visualization"]["tsne_perplexity"] = float(
+                min(tsne_perplexity, max(1.0, float((flat_z.size(0) - 1) // 3)))
+            )
+        except Exception as exc:
+            result.setdefault("visualization", {})["tsne_exported"] = False
+            result["visualization"]["tsne_error"] = str(exc)
+
+    with open(save_dir / "local_neighbors.json", "w") as f:
+        json.dump(build_local_neighbor_report(z, state, k=8, n_anchors=12), f, indent=2)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True, help="Object checkpoint path")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name, e.g. tworoom")
+    parser.add_argument("--state-key", type=str, default="proprio", help="State proxy key in dataset")
+    parser.add_argument("--frameskip", type=int, default=5)
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--n-sequences", type=int, default=128)
+    parser.add_argument("--max-points", type=int, default=512)
+    parser.add_argument("--knn-k", type=int, default=10)
+    parser.add_argument("--action-trials", type=int, default=8)
+    parser.add_argument("--interp-steps", type=int, default=9)
+    parser.add_argument("--perturb-scale", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=3072)
+    parser.add_argument("--save-dir", type=str, default=None)
+    parser.add_argument("--export-tsne", action="store_true", help="Export t-SNE projection if sklearn is installed")
+    parser.add_argument("--tsne-perplexity", type=float, default=30.0)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    print(f"[analyze_repr] loading model: {args.ckpt}")
+    model = load_model(args.ckpt, args.device)
+    history_size = infer_history_size(model)
+    print(f"[analyze_repr] dataset={args.dataset} state_key={args.state_key} history_size={history_size}")
+
+    batch = load_dataset_samples(
+        dataset_name=args.dataset,
+        state_key=args.state_key,
+        n_sequences=args.n_sequences,
+        history_size=history_size,
+        frameskip=args.frameskip,
+        img_size=args.img_size,
+        seed=args.seed,
+        device=args.device,
+    )
+    outputs = encode_sequences(model, batch)
+
+    result = {
+        "meta": {
+            "ckpt": args.ckpt,
+            "dataset": args.dataset,
+            "state_key": args.state_key,
+            "n_sequences": args.n_sequences,
+            "history_size": history_size,
+            "device": args.device,
+        },
+        "embedding": analyze_embedding(outputs["emb"]),
+        "topology": analyze_topology(
+            outputs["emb"], outputs["state"], k=args.knn_k, max_points=args.max_points
+        ),
+        "dynamics": analyze_dynamics(
+            outputs["emb"], outputs["state"], outputs["pred"], outputs["tgt"]
+        ),
+        "action_effect": analyze_action_effect(
+            model,
+            outputs["emb"],
+            outputs["action"],
+            n_trials=args.action_trials,
+            interp_steps=args.interp_steps,
+            perturb_scale=args.perturb_scale,
+        ),
+    }
+    result["interpretation"] = make_interpretation(args.dataset, result)
+
+    print_section("Meta", result["meta"])
+    print_section("Embedding", result["embedding"])
+    print_section("Topology", result["topology"])
+    print_section("Dynamics", result["dynamics"])
+    print_section("Action Effect", result["action_effect"])
+    print_hints(result["interpretation"])
+
+    if args.export_tsne:
+        print(
+            "\n[analyze_repr] t-SNE requested: this is for local-neighborhood visualisation only; "
+            "do not use it as a quantitative judge of global latent geometry."
+        )
+
+    if args.save_dir:
+        save_dir = Path(args.save_dir)
+        save_outputs(
+            save_dir,
+            result,
+            outputs["emb"],
+            outputs["state"],
+            export_tsne=args.export_tsne,
+            tsne_perplexity=args.tsne_perplexity,
+            seed=args.seed,
+        )
+        print(f"\n[analyze_repr] saved outputs to: {save_dir}")
+
+
+if __name__ == "__main__":
+    main()
