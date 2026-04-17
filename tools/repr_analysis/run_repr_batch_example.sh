@@ -5,6 +5,8 @@ set -euo pipefail
 # Edit the variables below, then run:
 #   bash tools/repr_analysis/run_repr_batch_example.sh
 #
+# This file must stay on Unix LF line endings. CRLF will break `bash`.
+#
 # MODEL_SPECS entries support two forms:
 #   1. "label=model_name"
 #      -> resolves to:
