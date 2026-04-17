@@ -75,7 +75,9 @@ def swm_forward(self, batch, stage, cfg):
         output["uniformity_loss"] = uniformity_loss(emb, cfg.loss.uniformity.t)
         output["reg_loss"] = output["uniformity_loss"]
     elif reg_type == "infonce":
-        output["infonce_loss"] = infonce_loss(emb, cfg.loss.infonce.temperature)
+        output["infonce_loss"] = infonce_loss(
+            pred_emb, tgt_emb, cfg.loss.infonce.temperature
+        )
         output["reg_loss"] = output["infonce_loss"]
     else:
         raise ValueError(f"Unsupported loss.regularizer.type: {reg_type}")

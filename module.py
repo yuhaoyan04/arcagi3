@@ -287,24 +287,37 @@ def uniformity_loss(emb: torch.Tensor, t: float) -> torch.Tensor:
     return torch.exp(-t * sq_dists).mean().log()
 
 
-def infonce_loss(emb: torch.Tensor, temperature: float) -> torch.Tensor:
-    """InfoNCE-style uniformity loss over all non-identical batch elements.
+def infonce_loss(
+    pred: torch.Tensor, target: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    """Batch-wise InfoNCE with next-step ground truth as the positive.
 
-    emb: (B, T, D) — unit vectors on S^{d-1}.
-    Treats every other element in the batch-time flattening as a negative and
-    minimises the normalized self-match probability.
+    pred: (B, T, D) predicted next-step embeddings (queries)
+    target: (B, T, D) ground-truth next-step embeddings (keys)
+
+    For each time step t, pred[b, t] is contrasted against target[:, t] across
+    the batch: the positive is target[b, t], and all other batch elements at
+    the same time step are negatives. Targets act as stop-gradient keys.
     """
-    z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
-    n = z.size(0)
-    if n < 2:
-        return z.new_tensor(0.0)
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"pred and target must have the same shape, got {pred.shape} vs {target.shape}"
+        )
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
 
-    logits = (z @ z.T) / temperature
-    logits = logits.masked_fill(
-        torch.eye(n, dtype=torch.bool, device=z.device), float("-inf")
-    )
-    log_denom = torch.logsumexp(logits, dim=-1)
-    return (-1.0 + log_denom).mean()
+    batch_size = pred.size(0)
+    if batch_size < 2:
+        return pred.new_tensor(0.0)
+
+    q = F.normalize(pred, dim=-1, eps=1e-8)
+    k = F.normalize(target.detach(), dim=-1, eps=1e-8)
+
+    logits = torch.einsum("btd,jtd->btj", q, k) / temperature  # (B, T, B)
+    logits = logits.reshape(-1, logits.size(-1))
+    labels = torch.arange(batch_size, device=pred.device)
+    labels = labels.unsqueeze(1).expand(-1, pred.size(1)).reshape(-1)
+    return F.cross_entropy(logits, labels)
 
 
 class ARPredictor(nn.Module):
