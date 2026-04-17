@@ -80,4 +80,4 @@ loss:
   uniformity:
     t: 2.0 # Wang & Isola temperature in log E[exp(-t ||mu_i - mu_j||^2)]
   infonce:
-    temperature: 0.1 # pred-vs-next-target InfoNCE; positives are aligned pairs, negatives are other batch items
+    temperature: 0.1 # symmetric InfoNCE at each time step; positives are aligned pred/target pairs, negatives include cross-view batch items and same-view non-self items
