@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -125,6 +125,26 @@ def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
     return float((x @ y) / denom)
 
 
+def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Rank correlation for geometry comparisons.
+
+    Pearson on distances is still useful, but it assumes a linear relation
+    between latent and state distances. Spearman is often a better fit for
+    representation geometry because it only asks whether distance ordering is
+    preserved.
+    """
+
+    def rankdata(v: torch.Tensor) -> torch.Tensor:
+        order = torch.argsort(v)
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.arange(order.numel(), dtype=torch.float32, device=v.device)
+        return ranks
+
+    x = x.float().reshape(-1)
+    y = y.float().reshape(-1)
+    return pearson_corr(rankdata(x), rankdata(y))
+
+
 def effective_rank(z: torch.Tensor) -> float:
     """Entropy-based effective rank of the centered embedding matrix."""
     z = z - z.mean(0, keepdim=True)
@@ -136,6 +156,36 @@ def effective_rank(z: torch.Tensor) -> float:
     p = power / total
     entropy = -(p * torch.log(p.clamp_min(1e-12))).sum()
     return float(torch.exp(entropy))
+
+
+def flatten_sequence_tensor(x: torch.Tensor) -> torch.Tensor:
+    return x.reshape(-1, x.size(-1)).cpu()
+
+
+def flattened_sequence_ids(x: torch.Tensor) -> torch.Tensor:
+    b, t = x.shape[:2]
+    return torch.arange(b).repeat_interleave(t)
+
+
+def sample_flat_points(
+    z: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    max_points: int,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    flat_z = flatten_sequence_tensor(z)
+    flat_s = flatten_sequence_tensor(state)
+    seq_ids = flattened_sequence_ids(state)
+
+    n_total = flat_z.shape[0]
+    n_keep = min(max_points, n_total)
+    if n_keep == n_total:
+        return flat_z, flat_s, seq_ids
+
+    g = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n_total, generator=g)[:n_keep]
+    return flat_z[indices], flat_s[indices], seq_ids[indices]
 
 
 def pca_projection(z: torch.Tensor, out_dim: int = 2) -> torch.Tensor:
@@ -187,7 +237,13 @@ def tsne_projection(
     return torch.from_numpy(proj)
 
 
-def knn_overlap(a_dist: torch.Tensor, b_dist: torch.Tensor, k: int) -> float:
+def knn_overlap(
+    a_dist: torch.Tensor,
+    b_dist: torch.Tensor,
+    k: int,
+    *,
+    invalid_mask: torch.Tensor | None = None,
+) -> float:
     """Average neighbor overlap between two distance matrices."""
     n = a_dist.size(0)
     a = a_dist.clone()
@@ -195,6 +251,9 @@ def knn_overlap(a_dist: torch.Tensor, b_dist: torch.Tensor, k: int) -> float:
     eye = torch.eye(n, dtype=torch.bool, device=a.device)
     a[eye] = float("inf")
     b[eye] = float("inf")
+    if invalid_mask is not None:
+        a[invalid_mask] = float("inf")
+        b[invalid_mask] = float("inf")
     a_idx = torch.topk(a, k=k, largest=False).indices
     b_idx = torch.topk(b, k=k, largest=False).indices
 
@@ -223,24 +282,44 @@ def analyze_embedding(z: torch.Tensor) -> Dict[str, float]:
     }
 
 
-def analyze_topology(z: torch.Tensor, state: torch.Tensor, k: int, max_points: int) -> Dict[str, float]:
-    flat_z = z.reshape(-1, z.size(-1)).cpu()
-    flat_s = state.reshape(-1, state.size(-1)).cpu()
-    n = min(max_points, flat_z.shape[0])
-    flat_z = flat_z[:n]
-    flat_s = flat_s[:n]
+def analyze_topology(
+    z: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    k: int,
+    max_points: int,
+    seed: int,
+) -> Dict[str, float]:
+    flat_z, flat_s, seq_ids = sample_flat_points(z, state, max_points=max_points, seed=seed)
+    n = flat_z.shape[0]
 
     flat_s = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
-
     z_dist = torch.cdist(flat_z, flat_z)
     s_dist = torch.cdist(flat_s, flat_s)
 
-    return {
+    offdiag = ~torch.eye(n, dtype=torch.bool)
+    cross_seq = offdiag & (seq_ids[:, None] != seq_ids[None, :])
+
+    result = {
         "n_points": int(n),
         "k": int(k),
-        "distance_corr": pearson_corr(exclude_diagonal(z_dist), exclude_diagonal(s_dist)),
+        "distance_corr": pearson_corr(z_dist[offdiag], s_dist[offdiag]),
+        "distance_rank_corr": spearman_corr(z_dist[offdiag], s_dist[offdiag]),
         "knn_overlap": knn_overlap(z_dist, s_dist, k=min(k, n - 1)),
     }
+
+    if bool(cross_seq.any()):
+        invalid_same_seq = ~cross_seq & ~torch.eye(n, dtype=torch.bool)
+        result["distance_corr_cross_seq"] = pearson_corr(z_dist[cross_seq], s_dist[cross_seq])
+        result["distance_rank_corr_cross_seq"] = spearman_corr(z_dist[cross_seq], s_dist[cross_seq])
+        result["knn_overlap_cross_seq"] = knn_overlap(
+            z_dist,
+            s_dist,
+            k=min(k, n - 1),
+            invalid_mask=invalid_same_seq,
+        )
+
+    return result
 
 
 def analyze_dynamics(z: torch.Tensor, state: torch.Tensor, pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
@@ -297,36 +376,50 @@ def analyze_action_effect(
         perturbed[:, -1] = perturbed[:, -1] + delta
         pred = model.predict(ctx_emb, model.action_encoder(perturbed))[:, -1]
 
-        perturb_norms.append(delta.norm(dim=-1).mean())
-        pred_shift_norms.append((pred - base_pred).norm(dim=-1).mean())
+        perturb_norms.append(delta.norm(dim=-1))
+        pred_shift_norms.append((pred - base_pred).norm(dim=-1))
 
-    perturb_norms = torch.stack(perturb_norms).cpu()
-    pred_shift_norms = torch.stack(pred_shift_norms).cpu()
+    perturb_norms = torch.cat(perturb_norms).cpu()
+    pred_shift_norms = torch.cat(pred_shift_norms).cpu()
 
-    action_a = base_action[:1].clone()
-    action_b = base_action[:1].clone()
-    action_b[:, -1] = action_b[:, -1] + action_std.unsqueeze(0) * perturb_scale
+    n_interp_anchors = min(8, base_action.size(0))
+    anchor_idx = torch.linspace(0, base_action.size(0) - 1, steps=n_interp_anchors).long().unique()
     alphas = torch.linspace(0, 1, interp_steps, device=base_action.device)
 
-    interp_preds: List[torch.Tensor] = []
-    single_ctx = ctx_emb[:1]
-    for alpha in alphas:
-        act = (1 - alpha) * action_a + alpha * action_b
-        pred = model.predict(single_ctx, model.action_encoder(act))[:, -1]
-        interp_preds.append(pred.squeeze(0))
+    endpoint_shifts = []
+    monotonicities = []
+    for idx in anchor_idx.tolist():
+        action_a = base_action[idx : idx + 1].clone()
+        action_b = base_action[idx : idx + 1].clone()
+        action_b[:, -1] = action_b[:, -1] + action_std.unsqueeze(0) * perturb_scale
 
-    interp_preds = torch.stack(interp_preds)
-    interp_dist = (interp_preds - interp_preds[0]).norm(dim=-1).cpu()
-    monotonicity = float(((interp_dist[1:] - interp_dist[:-1]) >= 0).float().mean())
+        interp_preds: List[torch.Tensor] = []
+        single_ctx = ctx_emb[idx : idx + 1]
+        for alpha in alphas:
+            act = (1 - alpha) * action_a + alpha * action_b
+            pred = model.predict(single_ctx, model.action_encoder(act))[:, -1]
+            interp_preds.append(pred.squeeze(0))
+
+        interp_preds = torch.stack(interp_preds)
+        interp_dist = (interp_preds - interp_preds[0]).norm(dim=-1).cpu()
+        endpoint_shifts.append(interp_dist[-1])
+        monotonicities.append(((interp_dist[1:] - interp_dist[:-1]) >= 0).float().mean())
+
+    endpoint_shifts = torch.stack(endpoint_shifts)
+    monotonicities = torch.stack(monotonicities)
 
     return {
         "n_trials": int(n_trials),
+        "n_action_pairs": int(perturb_norms.numel()),
+        "n_interp_anchors": int(anchor_idx.numel()),
         "perturb_scale": float(perturb_scale),
         "mean_action_perturb_norm": float(perturb_norms.mean()),
         "mean_pred_shift_norm": float(pred_shift_norms.mean()),
         "action_perturb_pred_shift_corr": pearson_corr(perturb_norms, pred_shift_norms),
-        "interpolation_endpoint_shift": float(interp_dist[-1]),
-        "interpolation_monotonicity": monotonicity,
+        "interpolation_endpoint_shift": float(endpoint_shifts.mean()),
+        "interpolation_endpoint_shift_std": float(endpoint_shifts.std()),
+        "interpolation_monotonicity": float(monotonicities.mean()),
+        "interpolation_monotonicity_std": float(monotonicities.std()),
     }
 
 
@@ -394,6 +487,8 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     topo = result["topology"]
     dyn = result["dynamics"]
     act = result["action_effect"]
+    topo_corr = topo.get("distance_corr_cross_seq", topo["distance_corr"])
+    topo_knn = topo.get("knn_overlap_cross_seq", topo["knn_overlap"])
 
     hints: List[str] = []
 
@@ -404,16 +499,16 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     else:
         hints.append("Embedding rank looks healthy; remaining issues likely come from geometry or dynamics rather than collapse.")
 
-    if topo["distance_corr"] < 0.2:
+    if topo_corr < 0.2:
         hints.append("Latent distances do not track state distances well; geometry is a likely bottleneck.")
-    elif topo["distance_corr"] < 0.5:
+    elif topo_corr < 0.5:
         hints.append("Latent geometry partially tracks state geometry, but there is still clear distortion.")
     else:
         hints.append("Latent geometry tracks state geometry reasonably well.")
 
-    if topo["knn_overlap"] < 0.2:
+    if topo_knn < 0.2:
         hints.append("Local neighborhoods disagree strongly between latent and state spaces.")
-    elif topo["knn_overlap"] > 0.5:
+    elif topo_knn > 0.5:
         hints.append("Local neighborhoods are preserved fairly well.")
 
     if dyn["latent_state_step_corr"] < 0.2:
@@ -581,7 +676,7 @@ def main():
         },
         "embedding": analyze_embedding(outputs["emb"]),
         "topology": analyze_topology(
-            outputs["emb"], outputs["state"], k=args.knn_k, max_points=args.max_points
+            outputs["emb"], outputs["state"], k=args.knn_k, max_points=args.max_points, seed=args.seed
         ),
         "dynamics": analyze_dynamics(
             outputs["emb"], outputs["state"], outputs["pred"], outputs["tgt"]

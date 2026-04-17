@@ -72,6 +72,12 @@ Useful flags:
 - `--tsne-perplexity`: default `30`
 - `--save-dir`: output directory for JSON exports
 
+Notes on rigor:
+- topology metrics now use a random flat-point subsample instead of taking the first `N` flattened points
+- topology also reports `*_cross_seq` metrics to reduce inflation from trivial within-sequence temporal neighbors
+- action-effect correlation is computed over all perturbed samples, not just one mean per trial
+- interpolation smoothness is averaged over multiple anchors instead of a single context
+
 ## 2. Outputs
 
 `analyze_repr.py` prints four analysis blocks:
@@ -179,15 +185,25 @@ Bad signs:
 
 Most important metrics:
 - `distance_corr`
+- `distance_rank_corr`
 - `knn_overlap`
+- `distance_corr_cross_seq`
+- `distance_rank_corr_cross_seq`
+- `knn_overlap_cross_seq`
 
 Good signs:
 - nearby states remain nearby in latent space
 - local neighborhoods are preserved
+- cross-sequence metrics stay close to all-pairs metrics, which suggests the result is not mainly coming from trivial temporal adjacency
 
 Bad signs:
 - local geometry is scrambled even though spread loss looks good
 - the manifold is fragmented into visually distinct islands
+
+Notes:
+- `distance_corr` is Pearson correlation on pairwise distances
+- `distance_rank_corr` is Spearman-style rank correlation on pairwise distances
+- `*_cross_seq` excludes comparisons inside the same sampled sequence window; these are often the more trustworthy metrics when judging planning geometry
 
 ### Dynamics
 
@@ -222,6 +238,10 @@ Good signs:
 Bad signs:
 - action perturbations barely move the latent prediction
 - interpolation is jagged or non-monotonic
+
+Notes:
+- `action_perturb_pred_shift_corr` is now computed over all perturbed samples, not just one averaged value per trial
+- `interpolation_monotonicity` is averaged over several anchors, so it is less sensitive to one lucky or unlucky context
 
 ## 6. How To Read t-SNE Correctly
 
