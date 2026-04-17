@@ -20,6 +20,7 @@ from jepa import SphericalJEPA
 from module import (
     ARPredictor,
     Embedder,
+    MLP,
     cosine_pred_loss,
     infonce_loss,
     spread_loss,
@@ -28,15 +29,45 @@ from module import (
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
-def build_projection_head(input_dim: int, output_dim: int, head_type: str) -> nn.Module:
-    if head_type == "linear":
-        return nn.Linear(input_dim, output_dim)
-    if head_type == "ln":
-        return nn.Sequential(nn.Linear(input_dim, output_dim), nn.LayerNorm(output_dim))
+def resolve_norm_fn(norm_name: str):
+    norm_name = norm_name.lower()
+    if norm_name in {"none", "identity"}:
+        return None
+    if norm_name in {"ln", "layernorm"}:
+        return nn.LayerNorm
+    if norm_name in {"bn", "batchnorm", "batchnorm1d"}:
+        return nn.BatchNorm1d
+    raise ValueError(f"Unsupported projection_head.norm_fn: {norm_name}")
+
+
+def build_projection_head(input_dim: int, output_dim: int, cfg) -> nn.Module:
+    head_type = cfg.type.lower()
+    norm_name = cfg.get("norm_fn", "none")
+
+    # Backward-compatible aliases for older configs.
     if head_type == "bn":
-        return nn.Sequential(
-            nn.Linear(input_dim, output_dim), nn.BatchNorm1d(output_dim)
+        head_type = "linear"
+        norm_name = "batchnorm1d"
+    elif head_type == "ln":
+        head_type = "linear"
+        norm_name = "layernorm"
+
+    norm_fn = resolve_norm_fn(norm_name)
+
+    if head_type == "linear":
+        layers = [nn.Linear(input_dim, output_dim)]
+        if norm_fn is not None:
+            layers.append(norm_fn(output_dim))
+        return nn.Sequential(*layers) if len(layers) > 1 else layers[0]
+
+    if head_type == "mlp":
+        return MLP(
+            input_dim=input_dim,
+            hidden_dim=cfg.get("hidden_dim", 2048),
+            output_dim=output_dim,
+            norm_fn=norm_fn,
         )
+
     raise ValueError(f"Unsupported projection_head.type: {head_type}")
 
 
@@ -151,9 +182,9 @@ def run(cfg):
 
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
-    head_type = cfg.encoder.projection_head.type
-    projector = build_projection_head(hidden_dim, embed_dim, head_type)
-    pred_proj = build_projection_head(hidden_dim, embed_dim, head_type)
+    head_cfg = cfg.encoder.projection_head
+    projector = build_projection_head(hidden_dim, embed_dim, head_cfg)
+    pred_proj = build_projection_head(hidden_dim, embed_dim, head_cfg)
 
     world_model = SphericalJEPA(
         encoder=encoder,

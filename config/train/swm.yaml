@@ -16,7 +16,9 @@ dump_object: True
 
 encoder:
   projection_head:
-    type: bn # linear, ln, or bn
+    type: linear # linear or mlp
+    norm_fn: batchnorm1d # none, layernorm, or batchnorm1d
+    hidden_dim: 2048 # only used when type=mlp
 
 trainer:
   max_epochs: 10
