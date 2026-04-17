@@ -88,6 +88,42 @@ Key hyperparameters to tune in `config/train/swm.yaml`:
 | `loss.spread.weight` | 0.1 | λ; increase if representations collapse |
 | `optimizer.lr` | 5e-5 | Same as LeWM |
 
+Planning / evaluation can now use a different space from the training
+regularizer. The default branch is unchanged:
+
+```yaml
+wm:
+  inference:
+    rollout_state_space: normalized
+    cost_space: normalized
+    cost_type: cosine
+```
+
+This matches the original spherical SWM.
+
+For a hybrid `exp b2` style setup, keep the regularizer on normalized embeddings
+but score plans in raw predictor space:
+
+```yaml
+loss:
+  pred:
+    type: mse
+    space: raw
+  regularizer:
+    type: uniformity
+    space: normalized
+
+wm:
+  inference:
+    rollout_state_space: normalized
+    cost_space: raw
+    cost_type: mse
+```
+
+That configuration keeps autoregressive predictor inputs on the same normalized
+manifold seen during training, while avoiding a train/eval mismatch in the
+final planning cost.
+
 Checkpoints are saved to `$STABLEWM_HOME/<subdir>/` upon completion.
 
 ## Evaluation

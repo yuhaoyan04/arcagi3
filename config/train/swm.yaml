@@ -64,6 +64,10 @@ wm:
   history_size: 3
   num_preds: 1
   embed_dim: 64 # sphere is compact; start smaller than LeWM's 192
+  inference:
+    rollout_state_space: normalized # normalized or raw
+    cost_space: normalized # normalized or raw
+    cost_type: cosine # cosine or mse
 
 predictor:
   depth: 6

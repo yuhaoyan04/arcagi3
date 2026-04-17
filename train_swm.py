@@ -223,6 +223,7 @@ def run(cfg):
     head_cfg = cfg.encoder.projection_head
     projector = build_projection_head(hidden_dim, embed_dim, head_cfg)
     pred_proj = build_projection_head(hidden_dim, embed_dim, head_cfg)
+    inference_cfg = cfg.wm.get("inference", {})
 
     world_model = SphericalJEPA(
         encoder=encoder,
@@ -230,6 +231,10 @@ def run(cfg):
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=pred_proj,
+        inference_rollout_state_space=inference_cfg.get("rollout_state_space", "normalized"),
+        inference_cost_space=inference_cfg.get("cost_space", "normalized"),
+        inference_cost_type=inference_cfg.get("cost_type", "cosine"),
+        analysis_prediction_space=cfg.loss.pred.get("space", "normalized"),
     )
 
     optimizers = {
