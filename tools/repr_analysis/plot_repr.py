@@ -21,23 +21,23 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Dict, List
 
 
-def load_rows(path: Path):
+def load_rows(path: Path) -> List[Dict[str, float]]:
     with open(path, "r") as f:
         return json.load(f)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, required=True, help="Projection JSON from analyze_repr.py")
-    parser.add_argument("--output", type=str, required=True, help="Output image path, e.g. out.png")
-    parser.add_argument("--color-dims", type=int, nargs="+", default=[0], help="State dimensions to color by")
-    parser.add_argument("--title", type=str, default=None)
-    parser.add_argument("--alpha", type=float, default=0.7)
-    parser.add_argument("--size", type=float, default=6.0)
-    args = parser.parse_args()
-
+def save_projection_plot(
+    rows: List[Dict[str, float]],
+    *,
+    output: Path,
+    color_dims: List[int],
+    title: str | None,
+    alpha: float,
+    size: float,
+):
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -45,35 +45,60 @@ def main():
             "plot_repr.py requires matplotlib. Install it with `pip install matplotlib`."
         ) from exc
 
-    rows = load_rows(Path(args.input))
     if not rows:
-        raise ValueError(f"No rows found in {args.input}")
+        raise ValueError("No rows found in projection input.")
 
     x = [row["x"] for row in rows]
     y = [row["y"] for row in rows]
 
-    n_panels = len(args.color_dims)
+    n_panels = len(color_dims)
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5), squeeze=False)
     axes = axes[0]
 
-    for ax, dim in zip(axes, args.color_dims):
+    for ax, dim in zip(axes, color_dims):
         key = f"state_{dim}"
         if key not in rows[0]:
             raise KeyError(f"{key} not found in projection file.")
         c = [row[key] for row in rows]
-        sc = ax.scatter(x, y, c=c, s=args.size, alpha=args.alpha, cmap="viridis")
+        sc = ax.scatter(x, y, c=c, s=size, alpha=alpha, cmap="viridis")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
-        ax.set_title(f"{Path(args.input).stem} colored by {key}")
+        ax.set_title(f"{output.stem} colored by {key}")
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
 
-    if args.title:
-        fig.suptitle(args.title)
+    if title:
+        fig.suptitle(title)
     fig.tight_layout()
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=200, bbox_inches="tight")
-    print(f"[plot_repr] saved to {out}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, required=True, help="Projection JSON from analyze_repr.py")
+    parser.add_argument("--output", type=str, required=True, help="Output image path, e.g. out.png")
+    parser.add_argument("--color-dims", type=int, nargs="+", default=[0], help="State dimensions to color by")
+    parser.add_argument("--title", type=str, default=None)
+    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--size", type=float, default=6.0)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    rows = load_rows(Path(args.input))
+    output = Path(args.output)
+    save_projection_plot(
+        rows,
+        output=output,
+        color_dims=args.color_dims,
+        title=args.title,
+        alpha=args.alpha,
+        size=args.size,
+    )
+    print(f"[plot_repr] saved to {output}")
 
 
 if __name__ == "__main__":

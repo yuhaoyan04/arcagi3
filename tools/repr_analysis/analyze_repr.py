@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,243 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 
 from utils import get_column_normalizer, get_img_preprocessor
+
+SECTION_ORDER = ["meta", "embedding", "topology", "dynamics", "action_effect", "visualization"]
+SECTION_TITLES = {
+    "meta": "Meta",
+    "embedding": "Embedding",
+    "topology": "Topology",
+    "dynamics": "Dynamics",
+    "action_effect": "Action Effect",
+    "visualization": "Visualization",
+}
+
+# Metric metadata is used in three places:
+# 1. to keep the code self-documenting,
+# 2. to help the batch-analysis script write readable tables,
+# 3. to make later metric additions explicit instead of burying meaning in names.
+METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
+    "embedding": {
+        "n_embeddings": {
+            "better": "context",
+            "summary": "Number of flattened latent points included in the analysis.",
+            "use": "Mainly for sanity checking that two runs are compared on the same sample count.",
+        },
+        "dim": {
+            "better": "context",
+            "summary": "Latent embedding dimensionality.",
+            "use": "Only a context field; it does not measure representation quality by itself.",
+        },
+        "norm_mean": {
+            "better": "context",
+            "summary": "Average L2 norm of latent embeddings.",
+            "use": "Check whether a method uses norm as part of the code. This matters before comparing scale-dependent metrics like latent step size or prediction error.",
+        },
+        "norm_std": {
+            "better": "context",
+            "summary": "Standard deviation of latent embedding norms.",
+            "use": "Near-zero values often mean the method constrains embeddings onto a thin shell or unit sphere.",
+        },
+        "dim_std_mean": {
+            "better": "higher",
+            "summary": "Average standard deviation across latent dimensions.",
+            "use": "Quick anti-collapse signal. Low values mean many dimensions barely move across samples.",
+        },
+        "dim_std_min": {
+            "better": "higher",
+            "summary": "Smallest per-dimension standard deviation.",
+            "use": "Detects dead or nearly dead latent directions.",
+        },
+        "dim_std_max": {
+            "better": "context",
+            "summary": "Largest per-dimension standard deviation.",
+            "use": "Helps detect whether a few dimensions dominate the representation.",
+        },
+        "inter_sample_cosine_mean": {
+            "better": "lower_abs",
+            "summary": "Average pairwise cosine similarity between different samples.",
+            "use": "Collapse check. Values drifting toward 1 mean samples point in nearly the same direction.",
+        },
+        "inter_sample_cosine_std": {
+            "better": "context",
+            "summary": "Spread of pairwise cosine similarities.",
+            "use": "Useful together with the mean to tell whether the latent cloud is uniform or anisotropic.",
+        },
+        "effective_rank": {
+            "better": "higher",
+            "summary": "Entropy-based effective rank of the centered embedding matrix.",
+            "use": "Interpret it as the number of directions that carry meaningful variance, not the raw embedding size. It is a stronger capacity check than just looking at per-dimension std.",
+        },
+    },
+    "topology": {
+        "n_points": {
+            "better": "context",
+            "summary": "Number of flattened points used for topology analysis.",
+            "use": "Sanity check that two runs used the same comparison budget.",
+        },
+        "k": {
+            "better": "context",
+            "summary": "Neighborhood size used in kNN overlap metrics.",
+            "use": "Context field for interpreting `knn_overlap` values.",
+        },
+        "distance_corr": {
+            "better": "higher",
+            "summary": "Pearson correlation between latent-space and state-space pairwise distances.",
+            "use": "Answers whether global distances are approximately linearly related. Good for spotting geometry collapse or large-scale distortions.",
+        },
+        "distance_rank_corr": {
+            "better": "higher",
+            "summary": "Rank correlation between latent-space and state-space pairwise distances.",
+            "use": "This is the `_rank` metric. It only asks whether distance ordering is preserved, so it remains informative when one method rescales or normalizes embeddings nonlinearly.",
+        },
+        "knn_overlap": {
+            "better": "higher",
+            "summary": "Average overlap between latent and state k-nearest neighbors.",
+            "use": "Local-geometry metric. High values mean nearby states stay nearby after encoding.",
+        },
+        "distance_corr_cross_seq": {
+            "better": "higher",
+            "summary": "Distance correlation computed only on pairs from different sampled sequences.",
+            "use": "This is the `_cross_seq` version. It removes easy within-sequence temporal neighbors that can inflate metrics even when cross-trajectory geometry is wrong.",
+        },
+        "distance_rank_corr_cross_seq": {
+            "better": "higher",
+            "summary": "Rank correlation on cross-sequence pairs only.",
+            "use": "Often the most trustworthy topology metric when judging planning geometry. It asks whether the model preserves which cross-trajectory states are closer or farther, without being fooled by temporal adjacency.",
+        },
+        "knn_overlap_cross_seq": {
+            "better": "higher",
+            "summary": "kNN overlap after excluding same-sequence candidates.",
+            "use": "Stricter local-geometry check. Useful when adjacent frames in one rollout are trivially close in both latent and state space.",
+        },
+    },
+    "dynamics": {
+        "latent_step_mean": {
+            "better": "context",
+            "summary": "Average one-step latent displacement.",
+            "use": "Only compare directly when embedding norms are comparable. Otherwise treat it as within-method context.",
+        },
+        "latent_step_std": {
+            "better": "context",
+            "summary": "Standard deviation of one-step latent displacement.",
+            "use": "Tells you whether the latent dynamics vary across easy vs hard transitions.",
+        },
+        "state_step_mean": {
+            "better": "context",
+            "summary": "Average one-step state displacement in the proxy state space.",
+            "use": "Reference scale for interpreting latent step statistics.",
+        },
+        "state_step_std": {
+            "better": "context",
+            "summary": "Standard deviation of one-step state displacement.",
+            "use": "Reference spread for transition magnitudes in the sampled batch.",
+        },
+        "latent_state_step_corr": {
+            "better": "higher",
+            "summary": "Correlation between latent step size and state step size.",
+            "use": "Checks whether larger physical changes also look larger in latent space. Good for action sensitivity and predictor calibration.",
+        },
+        "pred_error_mean": {
+            "better": "lower",
+            "summary": "Average Euclidean prediction error between one-step prediction and target embedding.",
+            "use": "Useful within one method family, but scale-dependent. Always read it together with `norm_mean` or cosine metrics before comparing across methods.",
+        },
+        "pred_error_std": {
+            "better": "lower",
+            "summary": "Standard deviation of Euclidean prediction error.",
+            "use": "Helps tell whether the predictor is consistently wrong or fails only on certain transitions.",
+        },
+        "pred_target_cosine_mean": {
+            "better": "higher",
+            "summary": "Average cosine similarity between one-step prediction and target embedding.",
+            "use": "Scale-free predictor metric. Particularly useful when one method enforces unit-norm embeddings.",
+        },
+        "pred_target_cosine_std": {
+            "better": "lower",
+            "summary": "Standard deviation of prediction-target cosine similarity.",
+            "use": "Low spread means prediction quality is more consistent across transitions.",
+        },
+        "pred_target_cosine_distance_mean": {
+            "better": "lower",
+            "summary": "Average cosine distance between one-step prediction and target embedding.",
+            "use": "Equivalent information to cosine similarity but in a lower-is-better form that is sometimes easier to compare in tables.",
+        },
+    },
+    "action_effect": {
+        "n_trials": {
+            "better": "context",
+            "summary": "Number of perturbation trials used in action-effect analysis.",
+            "use": "Context field for the robustness of the perturbation statistics.",
+        },
+        "n_action_pairs": {
+            "better": "context",
+            "summary": "Number of action-perturbation / prediction-shift pairs evaluated.",
+            "use": "Sanity check that the action-effect estimate is based on enough samples.",
+        },
+        "n_interp_anchors": {
+            "better": "context",
+            "summary": "Number of anchors used for action interpolation tests.",
+            "use": "Context field for how many contexts contribute to interpolation smoothness.",
+        },
+        "perturb_scale": {
+            "better": "context",
+            "summary": "Scale multiplier applied to action standard deviation when perturbing actions.",
+            "use": "Keep this fixed across runs if you want fair action-effect comparisons.",
+        },
+        "mean_action_perturb_norm": {
+            "better": "context",
+            "summary": "Average norm of the sampled action perturbations.",
+            "use": "Reference scale for interpreting the resulting latent shift.",
+        },
+        "mean_pred_shift_norm": {
+            "better": "context",
+            "summary": "Average norm of the prediction change caused by action perturbations.",
+            "use": "Within-method measure of how much action can move the prediction. It is scale-dependent if embeddings use different norms.",
+        },
+        "action_perturb_pred_shift_corr": {
+            "better": "higher",
+            "summary": "Correlation between perturbation magnitude and prediction-shift magnitude.",
+            "use": "Tests whether larger action changes reliably cause larger latent changes. This is stronger than just asking whether any shift happened at all.",
+        },
+        "interpolation_endpoint_shift": {
+            "better": "context",
+            "summary": "Average latent distance from the interpolation start to the interpolation end.",
+            "use": "Context field for how much the chosen action interpolation actually moves the prediction.",
+        },
+        "interpolation_endpoint_shift_std": {
+            "better": "lower",
+            "summary": "Standard deviation of endpoint shift across interpolation anchors.",
+            "use": "High spread means action sensitivity is unstable across contexts.",
+        },
+        "interpolation_monotonicity": {
+            "better": "higher",
+            "summary": "Fraction of interpolation steps whose latent distance grows monotonically from the start.",
+            "use": "Smoothness check. High values mean action interpolation produces orderly latent motion instead of jagged jumps.",
+        },
+        "interpolation_monotonicity_std": {
+            "better": "lower",
+            "summary": "Standard deviation of interpolation monotonicity across anchors.",
+            "use": "Low spread means the smoothness pattern is stable across contexts.",
+        },
+    },
+    "visualization": {
+        "tsne_exported": {
+            "better": "context",
+            "summary": "Whether t-SNE export succeeded.",
+            "use": "Context only. t-SNE is for visual inspection, not for quantitative selection.",
+        },
+        "tsne_perplexity": {
+            "better": "context",
+            "summary": "Perplexity actually used for t-SNE export.",
+            "use": "Useful when comparing plots produced from different sample counts.",
+        },
+        "tsne_error": {
+            "better": "context",
+            "summary": "Error message captured when t-SNE export failed.",
+            "use": "Debug field for the visualization step.",
+        },
+    },
+}
 
 
 def load_model(ckpt_path: str, device: str = "cpu"):
@@ -128,10 +365,11 @@ def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
     """Rank correlation for geometry comparisons.
 
-    Pearson on distances is still useful, but it assumes a linear relation
-    between latent and state distances. Spearman is often a better fit for
-    representation geometry because it only asks whether distance ordering is
-    preserved.
+    Pearson correlation on distances is still useful, but it assumes a roughly
+    linear relationship between latent and state distances. The `_rank` metric
+    relaxes that assumption: it only checks whether the ordering of distances is
+    preserved. This is especially helpful when comparing methods that impose
+    different latent scales, such as unit-sphere losses vs unconstrained codes.
     """
 
     def rankdata(v: torch.Tensor) -> torch.Tensor:
@@ -146,7 +384,14 @@ def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def effective_rank(z: torch.Tensor) -> float:
-    """Entropy-based effective rank of the centered embedding matrix."""
+    """Entropy-based effective rank of the centered embedding matrix.
+
+    The raw embedding dimension answers "how many coordinates exist?".
+    Effective rank answers "how many directions actually carry variance?".
+    A 192-dim embedding can still behave like a 20-dim code if almost all
+    variance is concentrated in a small subspace.
+    """
+
     z = z - z.mean(0, keepdim=True)
     singular_values = torch.linalg.svdvals(z)
     power = singular_values.square()
@@ -163,6 +408,7 @@ def flatten_sequence_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 def flattened_sequence_ids(x: torch.Tensor) -> torch.Tensor:
+    """Return the sequence id for each flattened time step."""
     b, t = x.shape[:2]
     return torch.arange(b).repeat_interleave(t)
 
@@ -174,6 +420,12 @@ def sample_flat_points(
     max_points: int,
     seed: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Randomly subsample flattened points for topology analysis.
+
+    Random subsampling avoids a subtle bias from taking the first N flattened
+    points, which would over-represent early sequences and time steps.
+    """
+
     flat_z = flatten_sequence_tensor(z)
     flat_s = flatten_sequence_tensor(state)
     seq_ids = flattened_sequence_ids(state)
@@ -205,9 +457,9 @@ def tsne_projection(
 ) -> torch.Tensor:
     """Optional t-SNE projection for visual inspection of local neighborhoods.
 
-    This is intentionally separate from the quantitative analysis because t-SNE
-    is useful for visualising local structure, but not reliable for judging
-    global geometry.
+    This stays separate from the quantitative analysis because t-SNE is useful
+    for visualizing local structure, but not reliable for judging global
+    geometry or absolute cluster spacing.
     """
     try:
         from sklearn.manifold import TSNE
@@ -244,7 +496,13 @@ def knn_overlap(
     *,
     invalid_mask: torch.Tensor | None = None,
 ) -> float:
-    """Average neighbor overlap between two distance matrices."""
+    """Average neighbor overlap between two distance matrices.
+
+    This is a local-geometry metric. Unlike distance correlations, it does not
+    care about exact metric scale; it only asks whether each point keeps roughly
+    the same nearest neighbors after encoding.
+    """
+
     n = a_dist.size(0)
     a = a_dist.clone()
     b = b_dist.clone()
@@ -264,6 +522,7 @@ def knn_overlap(
 
 
 def analyze_embedding(z: torch.Tensor) -> Dict[str, float]:
+    """Measure distribution health and anti-collapse behavior of the latent space."""
     flat = z.reshape(-1, z.size(-1)).cpu()
     norms = flat.norm(dim=-1)
     cos = F.normalize(flat, dim=-1) @ F.normalize(flat, dim=-1).T
@@ -290,9 +549,27 @@ def analyze_topology(
     max_points: int,
     seed: int,
 ) -> Dict[str, float]:
+    """Measure whether latent geometry preserves state-space geometry.
+
+    Two additions here deserve special attention:
+
+    - `distance_rank_corr`:
+      a Spearman-style version of distance correlation that is robust to
+      monotonic rescaling. This is important when one method constrains latent
+      norms and another does not.
+
+    - `*_cross_seq` metrics:
+      these exclude pairs from the same sampled sequence window. Within-sequence
+      temporal neighbors are often trivially close and can make a broken
+      representation look better than it is. Cross-sequence metrics are stricter
+      and are usually more informative for planning-style geometry.
+    """
+
     flat_z, flat_s, seq_ids = sample_flat_points(z, state, max_points=max_points, seed=seed)
     n = flat_z.shape[0]
 
+    # Standardize state coordinates so one physical dimension does not dominate
+    # the distance metric purely due to units or scale.
     flat_s = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
     z_dist = torch.cdist(flat_z, flat_z)
     s_dist = torch.cdist(flat_s, flat_s)
@@ -323,6 +600,7 @@ def analyze_topology(
 
 
 def analyze_dynamics(z: torch.Tensor, state: torch.Tensor, pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
+    """Measure whether one-step latent dynamics track real state transitions."""
     z_now = z[:, :-1]
     z_next = z[:, 1:]
     s_now = state[:, :-1]
@@ -361,6 +639,7 @@ def analyze_action_effect(
     interp_steps: int,
     perturb_scale: float,
 ) -> Dict[str, float]:
+    """Measure whether action changes produce structured latent branching."""
     ctx_len = infer_history_size(model)
     ctx_emb = z[:, :ctx_len]
     base_action = action[:, :ctx_len].clone()
@@ -429,8 +708,14 @@ def build_local_neighbor_report(
     *,
     k: int,
     n_anchors: int,
-) -> List[Dict]:
-    """Compare local neighborhoods in latent space and state space."""
+) -> List[Dict[str, Any]]:
+    """Compare local neighborhoods in latent space and state space.
+
+    This file is meant for qualitative debugging after the scalar metrics point
+    to a topology problem. It lets you inspect concrete anchor states and see
+    which neighbors are preserved vs scrambled.
+    """
+
     flat_z = z.reshape(-1, z.size(-1)).cpu()
     flat_s = state.reshape(-1, state.size(-1)).cpu()
     n = flat_z.shape[0]
@@ -445,7 +730,7 @@ def build_local_neighbor_report(
     s_dist[eye] = float("inf")
 
     anchors = torch.linspace(0, n - 1, steps=min(n_anchors, n)).long().unique()
-    report = []
+    report: List[Dict[str, Any]] = []
     for anchor in anchors.tolist():
         z_nn = torch.topk(z_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
         s_nn = torch.topk(s_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
@@ -548,23 +833,124 @@ def to_serializable(obj):
     return obj
 
 
-def print_section(title: str, metrics: Dict[str, float]):
-    print(f"\n{'=' * 72}")
-    print(title)
-    print(f"{'=' * 72}")
+def metric_spec(section: str, key: str) -> Dict[str, str]:
+    return METRIC_SPECS.get(section, {}).get(key, {})
+
+
+def metric_entries(result: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, Any]]:
+    """Return scalar-like result entries in a stable order for table export."""
+    entries: List[Tuple[str, str, Any]] = []
+    for section in SECTION_ORDER:
+        metrics = result.get(section)
+        if not isinstance(metrics, dict):
+            continue
+        preferred_keys = list(METRIC_SPECS.get(section, {}).keys())
+        extra_keys = [key for key in metrics if key not in preferred_keys]
+        for key in preferred_keys + extra_keys:
+            if key in metrics:
+                entries.append((section, key, metrics[key]))
+    return entries
+
+
+def format_metric_value(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def format_section(title: str, metrics: Dict[str, Any]) -> str:
+    lines = [f"\n{'=' * 72}", title, f"{'=' * 72}"]
     for key, value in metrics.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.6f}")
-        else:
-            print(f"{key}: {value}")
+        lines.append(f"{key}: {format_metric_value(value)}")
+    return "\n".join(lines)
 
 
-def print_hints(hints: List[str]):
-    print(f"\n{'=' * 72}")
-    print("Interpretation")
-    print(f"{'=' * 72}")
+def format_hints(hints: List[str]) -> str:
+    lines = [f"\n{'=' * 72}", "Interpretation", f"{'=' * 72}"]
     for hint in hints:
-        print(f"- {hint}")
+        lines.append(f"- {hint}")
+    return "\n".join(lines)
+
+
+def format_analysis_report(result: Dict[str, Dict[str, Any]]) -> str:
+    chunks: List[str] = []
+    for section in SECTION_ORDER:
+        metrics = result.get(section)
+        if isinstance(metrics, dict) and metrics:
+            chunks.append(format_section(SECTION_TITLES.get(section, section.title()), metrics))
+    hints = result.get("interpretation")
+    if isinstance(hints, list):
+        chunks.append(format_hints(hints))
+    return "\n".join(chunks).lstrip()
+
+
+def run_analysis(
+    *,
+    ckpt: str,
+    dataset: str,
+    state_key: str,
+    frameskip: int,
+    img_size: int,
+    n_sequences: int,
+    max_points: int,
+    knn_k: int,
+    action_trials: int,
+    interp_steps: int,
+    perturb_scale: float,
+    seed: int,
+    device: str,
+    log: Callable[[str], None] | None = print,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, torch.Tensor]]:
+    """Run the full representation analysis and return metrics plus tensors."""
+
+    if log is not None:
+        log(f"[analyze_repr] loading model: {ckpt}")
+    model = load_model(ckpt, device)
+    history_size = infer_history_size(model)
+    if log is not None:
+        log(f"[analyze_repr] dataset={dataset} state_key={state_key} history_size={history_size}")
+
+    batch = load_dataset_samples(
+        dataset_name=dataset,
+        state_key=state_key,
+        n_sequences=n_sequences,
+        history_size=history_size,
+        frameskip=frameskip,
+        img_size=img_size,
+        seed=seed,
+        device=device,
+    )
+    outputs = encode_sequences(model, batch)
+
+    result = {
+        "meta": {
+            "ckpt": ckpt,
+            "dataset": dataset,
+            "state_key": state_key,
+            "n_sequences": n_sequences,
+            "history_size": history_size,
+            "device": device,
+        },
+        "embedding": analyze_embedding(outputs["emb"]),
+        "topology": analyze_topology(
+            outputs["emb"],
+            outputs["state"],
+            k=knn_k,
+            max_points=max_points,
+            seed=seed,
+        ),
+        "dynamics": analyze_dynamics(outputs["emb"], outputs["state"], outputs["pred"], outputs["tgt"]),
+        "action_effect": analyze_action_effect(
+            model,
+            outputs["emb"],
+            outputs["action"],
+            n_trials=action_trials,
+            interp_steps=interp_steps,
+            perturb_scale=perturb_scale,
+        ),
+    }
+    result["interpretation"] = make_interpretation(dataset, result)
+    return result, outputs
 
 
 def save_projection_rows(proj: torch.Tensor, state: torch.Tensor, save_path: Path):
@@ -588,9 +974,15 @@ def save_projection_rows(proj: torch.Tensor, state: torch.Tensor, save_path: Pat
         json.dump(rows, f, indent=2)
 
 
+def save_metric_guide(save_path: Path):
+    """Save the metric glossary so result folders remain self-explanatory."""
+    with open(save_path, "w") as f:
+        json.dump(to_serializable(METRIC_SPECS), f, indent=2)
+
+
 def save_outputs(
     save_dir: Path,
-    result: Dict[str, Dict[str, float]],
+    result: Dict[str, Dict[str, Any]],
     z: torch.Tensor,
     state: torch.Tensor,
     *,
@@ -599,9 +991,6 @@ def save_outputs(
     seed: int,
 ):
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(save_dir / "summary.json", "w") as f:
-        json.dump(to_serializable(result), f, indent=2)
 
     flat_z = z.reshape(-1, z.size(-1)).cpu()
     pca_proj = pca_projection(flat_z, out_dim=2)
@@ -627,8 +1016,12 @@ def save_outputs(
     with open(save_dir / "local_neighbors.json", "w") as f:
         json.dump(build_local_neighbor_report(z, state, k=8, n_anchors=12), f, indent=2)
 
+    with open(save_dir / "summary.json", "w") as f:
+        json.dump(to_serializable(result), f, indent=2)
+    save_metric_guide(save_dir / "metric_guide.json")
 
-def main():
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Object checkpoint path")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name, e.g. tworoom")
@@ -646,58 +1039,29 @@ def main():
     parser.add_argument("--export-tsne", action="store_true", help="Export t-SNE projection if sklearn is installed")
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    print(f"[analyze_repr] loading model: {args.ckpt}")
-    model = load_model(args.ckpt, args.device)
-    history_size = infer_history_size(model)
-    print(f"[analyze_repr] dataset={args.dataset} state_key={args.state_key} history_size={history_size}")
-
-    batch = load_dataset_samples(
-        dataset_name=args.dataset,
+    result, outputs = run_analysis(
+        ckpt=args.ckpt,
+        dataset=args.dataset,
         state_key=args.state_key,
-        n_sequences=args.n_sequences,
-        history_size=history_size,
         frameskip=args.frameskip,
         img_size=args.img_size,
+        n_sequences=args.n_sequences,
+        max_points=args.max_points,
+        knn_k=args.knn_k,
+        action_trials=args.action_trials,
+        interp_steps=args.interp_steps,
+        perturb_scale=args.perturb_scale,
         seed=args.seed,
         device=args.device,
+        log=print,
     )
-    outputs = encode_sequences(model, batch)
-
-    result = {
-        "meta": {
-            "ckpt": args.ckpt,
-            "dataset": args.dataset,
-            "state_key": args.state_key,
-            "n_sequences": args.n_sequences,
-            "history_size": history_size,
-            "device": args.device,
-        },
-        "embedding": analyze_embedding(outputs["emb"]),
-        "topology": analyze_topology(
-            outputs["emb"], outputs["state"], k=args.knn_k, max_points=args.max_points, seed=args.seed
-        ),
-        "dynamics": analyze_dynamics(
-            outputs["emb"], outputs["state"], outputs["pred"], outputs["tgt"]
-        ),
-        "action_effect": analyze_action_effect(
-            model,
-            outputs["emb"],
-            outputs["action"],
-            n_trials=args.action_trials,
-            interp_steps=args.interp_steps,
-            perturb_scale=args.perturb_scale,
-        ),
-    }
-    result["interpretation"] = make_interpretation(args.dataset, result)
-
-    print_section("Meta", result["meta"])
-    print_section("Embedding", result["embedding"])
-    print_section("Topology", result["topology"])
-    print_section("Dynamics", result["dynamics"])
-    print_section("Action Effect", result["action_effect"])
-    print_hints(result["interpretation"])
 
     if args.export_tsne:
         print(
@@ -717,6 +1081,8 @@ def main():
             seed=args.seed,
         )
         print(f"\n[analyze_repr] saved outputs to: {save_dir}")
+
+    print(f"\n{format_analysis_report(result)}")
 
 
 if __name__ == "__main__":

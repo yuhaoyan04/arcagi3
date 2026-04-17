@@ -23,9 +23,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Dict, List
 
 
-def load_rows(analysis_dir: Path, projection: str):
+def load_rows(analysis_dir: Path, projection: str) -> List[Dict[str, float]]:
     file_name = f"{projection}_projection.json"
     path = analysis_dir / file_name
     if not path.exists():
@@ -37,7 +38,7 @@ def load_rows(analysis_dir: Path, projection: str):
     return rows
 
 
-def load_summary(analysis_dir: Path):
+def load_summary(analysis_dir: Path) -> Dict:
     path = analysis_dir / "summary.json"
     if not path.exists():
         return {}
@@ -50,33 +51,42 @@ def make_caption(summary: dict) -> str:
         return ""
     parts = []
     meta = summary.get("meta", {})
+    emb = summary.get("embedding", {})
     topo = summary.get("topology", {})
     dyn = summary.get("dynamics", {})
     if meta.get("dataset"):
         parts.append(f"dataset={meta['dataset']}")
-    if "distance_corr" in topo:
-        parts.append(f"dist_corr={topo['distance_corr']:.3f}")
-    if "knn_overlap" in topo:
-        parts.append(f"knn={topo['knn_overlap']:.3f}")
+    if "effective_rank" in emb:
+        parts.append(f"rank={emb['effective_rank']:.1f}")
+    dist_corr = topo.get("distance_corr_cross_seq", topo.get("distance_corr"))
+    rank_corr = topo.get("distance_rank_corr_cross_seq", topo.get("distance_rank_corr"))
+    knn = topo.get("knn_overlap_cross_seq", topo.get("knn_overlap"))
+    if dist_corr is not None:
+        parts.append(f"dist_corr={dist_corr:.3f}")
+    if rank_corr is not None:
+        parts.append(f"rank_corr={rank_corr:.3f}")
+    if knn is not None:
+        parts.append(f"knn={knn:.3f}")
     if "latent_state_step_corr" in dyn:
         parts.append(f"dyn_corr={dyn['latent_state_step_corr']:.3f}")
     return " | ".join(parts)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--left-dir", type=str, required=True)
-    parser.add_argument("--right-dir", type=str, required=True)
-    parser.add_argument("--left-label", type=str, default="Left")
-    parser.add_argument("--right-label", type=str, default="Right")
-    parser.add_argument("--projection", type=str, default="tsne", choices=["pca", "tsne"])
-    parser.add_argument("--color-dims", type=int, nargs="+", default=[0], help="State dimensions to color by")
-    parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--title", type=str, default=None)
-    parser.add_argument("--alpha", type=float, default=0.7)
-    parser.add_argument("--size", type=float, default=6.0)
-    args = parser.parse_args()
-
+def save_comparison_plot(
+    *,
+    left_rows: List[Dict[str, float]],
+    right_rows: List[Dict[str, float]],
+    left_summary: Dict,
+    right_summary: Dict,
+    left_label: str,
+    right_label: str,
+    projection: str,
+    color_dims: List[int],
+    output: Path,
+    title: str | None,
+    alpha: float,
+    size: float,
+):
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -84,17 +94,10 @@ def main():
             "compare_repr.py requires matplotlib. Install it with `pip install matplotlib`."
         ) from exc
 
-    left_dir = Path(args.left_dir)
-    right_dir = Path(args.right_dir)
-    left_rows = load_rows(left_dir, args.projection)
-    right_rows = load_rows(right_dir, args.projection)
-    left_summary = load_summary(left_dir)
-    right_summary = load_summary(right_dir)
-
-    ncols = len(args.color_dims)
+    ncols = len(color_dims)
     fig, axes = plt.subplots(2, ncols, figsize=(6 * ncols, 10), squeeze=False)
 
-    for col, dim in enumerate(args.color_dims):
+    for col, dim in enumerate(color_dims):
         key = f"state_{dim}"
         if key not in left_rows[0] or key not in right_rows[0]:
             raise KeyError(f"{key} not found in both projection files")
@@ -114,14 +117,28 @@ def main():
         ax_r = axes[1][col]
 
         sc_l = ax_l.scatter(
-            left_x, left_y, c=left_c, s=args.size, alpha=args.alpha, cmap="viridis", vmin=vmin, vmax=vmax
+            left_x,
+            left_y,
+            c=left_c,
+            s=size,
+            alpha=alpha,
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
         )
         sc_r = ax_r.scatter(
-            right_x, right_y, c=right_c, s=args.size, alpha=args.alpha, cmap="viridis", vmin=vmin, vmax=vmax
+            right_x,
+            right_y,
+            c=right_c,
+            s=size,
+            alpha=alpha,
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
         )
 
-        ax_l.set_title(f"{args.left_label} | {args.projection.upper()} | {key}")
-        ax_r.set_title(f"{args.right_label} | {args.projection.upper()} | {key}")
+        ax_l.set_title(f"{left_label} | {projection.upper()} | {key}")
+        ax_r.set_title(f"{right_label} | {projection.upper()} | {key}")
         ax_l.set_xlabel("x")
         ax_l.set_ylabel("y")
         ax_r.set_xlabel("x")
@@ -136,14 +153,56 @@ def main():
 
         fig.colorbar(sc_l, ax=[ax_l, ax_r], fraction=0.03, pad=0.02)
 
-    if args.title:
-        fig.suptitle(args.title)
+    if title:
+        fig.suptitle(title)
     fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=200, bbox_inches="tight")
-    print(f"[compare_repr] saved to {out}")
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--left-dir", type=str, required=True)
+    parser.add_argument("--right-dir", type=str, required=True)
+    parser.add_argument("--left-label", type=str, default="Left")
+    parser.add_argument("--right-label", type=str, default="Right")
+    parser.add_argument("--projection", type=str, default="tsne", choices=["pca", "tsne"])
+    parser.add_argument("--color-dims", type=int, nargs="+", default=[0], help="State dimensions to color by")
+    parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--title", type=str, default=None)
+    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--size", type=float, default=6.0)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    left_dir = Path(args.left_dir)
+    right_dir = Path(args.right_dir)
+    left_rows = load_rows(left_dir, args.projection)
+    right_rows = load_rows(right_dir, args.projection)
+    left_summary = load_summary(left_dir)
+    right_summary = load_summary(right_dir)
+
+    output = Path(args.output)
+    save_comparison_plot(
+        left_rows=left_rows,
+        right_rows=right_rows,
+        left_summary=left_summary,
+        right_summary=right_summary,
+        left_label=args.left_label,
+        right_label=args.right_label,
+        projection=args.projection,
+        color_dims=args.color_dims,
+        output=output,
+        title=args.title,
+        alpha=args.alpha,
+        size=args.size,
+    )
+    print(f"[compare_repr] saved to {output}")
 
 
 if __name__ == "__main__":

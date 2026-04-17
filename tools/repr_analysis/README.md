@@ -16,8 +16,12 @@ The goal is not just to ask "did the model avoid collapse?", but to answer:
   Runs quantitative analysis on one checkpoint and one dataset.
 - [plot_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/plot_repr.py)
   Plots one PCA / t-SNE projection export.
+- [batch_repr_analysis.py](/home/ag/projects/le-wm/tools/repr_analysis/batch_repr_analysis.py)
+  Runs the same analysis for multiple checkpoints and writes aggregate tables.
 - [compare_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/compare_repr.py)
   Draws side-by-side comparison plots from two analysis directories.
+- [run_repr_batch_example.sh](/home/ag/projects/le-wm/tools/repr_analysis/run_repr_batch_example.sh)
+  Editable shell example that wraps the batch script for multi-model comparison.
 - [probe.py](/home/ag/projects/le-wm/probe.py)
   Older lightweight probing script. Still useful, but less systematic.
 
@@ -31,6 +35,12 @@ Use `analyze_repr.py` when:
 Use `plot_repr.py` when:
 - you already ran `analyze_repr.py`
 - you want a quick visualization similar to Figure 9 in the paper
+
+Use `batch_repr_analysis.py` when:
+- you want one Python entrypoint instead of a long bash script
+- you want to compare several models on the same dataset with identical settings
+- you want aggregate `CSV` / `Markdown` tables for later visualization
+- you want the script to also emit pairwise comparison plots
 
 Use `compare_repr.py` when:
 - you want to compare `SIGReg` vs `BN+uniformity`
@@ -103,6 +113,8 @@ When `--save-dir` is provided:
 
 - `summary.json`
   All scalar metrics and interpretation hints.
+- `metric_guide.json`
+  Glossary describing what each metric means and how to use it.
 - `pca_projection.json`
   2D PCA projection of latent embeddings.
 - `tsne_projection.json`
@@ -110,7 +122,58 @@ When `--save-dir` is provided:
 - `local_neighbors.json`
   Anchor-by-anchor comparison of nearest neighbors in latent vs state space.
 
-## 3. Visualize One Run
+## 3. Batch Analyze Multiple Runs
+
+When you want a single Python command to replace a manual bash loop, use
+`batch_repr_analysis.py`.
+
+Example:
+
+```bash
+python -m tools.repr_analysis.batch_repr_analysis \
+  --dataset /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/pusht_expert_train \
+  --state-key proprio \
+  --save-dir /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/repr_analysis/pusht_batch_compare \
+  --plot-projections pca \
+  --compare-projections pca \
+  --color-dims 0 1 \
+  --model "SIGReg=/opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/ckpt/pusht_lewm_20260416/pusht_lewm_20260416_epoch_9_object.ckpt" \
+  --model "BN+uniformity=/opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/ckpt/pusht_swm_v0_mlp_bn_uniform_lambda_0p1_t_2_emb_dim_192_20260417/pusht_swm_v0_mlp_bn_uniform_lambda_0p1_t_2_emb_dim_192_20260417_epoch_9_object.ckpt"
+```
+
+Batch outputs:
+
+- one subdirectory per model with the usual `summary.json`, projection JSONs, and optional plots
+- `metrics_wide.csv`
+  one row per model, one column per metric
+- `metrics_long.csv`
+  one row per `(model, metric)` pair with metric description fields; this is the easiest file to use for later plotting
+- `metrics_table.md`
+  human-readable per-section tables
+- `batch_summary.json`
+  machine-readable aggregate result bundle
+- `batch_report.txt`
+  the full printed logs and per-model metric dumps
+- `pairwise_compare/`
+  optional side-by-side comparison plots plus `compare_manifest.json`
+
+Pairwise compare rules:
+
+- if you pass exactly two models and set `--compare-projections`, the script compares those two automatically
+- use `--compare-all-pairs` to render all pairs when you pass more than two models
+- use `--compare-pair "A=B"` to compare only specific labels
+
+Example shell wrapper:
+
+```bash
+bash tools/repr_analysis/run_repr_batch_example.sh
+```
+
+That example script mirrors your current `STABLEWM_HOME / DATASET / EPOCH / model name`
+workflow, but now uses a `MODEL_SPECS` array so you can pass 2, 3, or more models in one run.
+Each entry supports `label=model_name` or `label=/full/path/to.ckpt`.
+
+## 4. Visualize One Run
 
 Plot one exported projection:
 
@@ -138,7 +201,7 @@ python tools/repr_analysis/plot_repr.py \
   --color-dims 0
 ```
 
-## 4. Compare Two Runs
+## 5. Compare Two Runs
 
 Compare `SIGReg` vs `BN+uniformity`:
 
@@ -167,7 +230,7 @@ python tools/repr_analysis/compare_repr.py \
   --right-label BN+uniformity
 ```
 
-## 5. How To Read The Results
+## 6. How To Read The Results
 
 ### Embedding
 
@@ -202,8 +265,10 @@ Bad signs:
 
 Notes:
 - `distance_corr` is Pearson correlation on pairwise distances
-- `distance_rank_corr` is Spearman-style rank correlation on pairwise distances
+- `distance_rank_corr` is the `_rank` metric: a Spearman-style rank correlation on pairwise distances
+- use `_rank` when you care about whether the latent preserves the ordering of distances, even if one method rescales or normalizes the geometry
 - `*_cross_seq` excludes comparisons inside the same sampled sequence window; these are often the more trustworthy metrics when judging planning geometry
+- use `_cross_seq` as the stricter number when adjacent frames inside one rollout are trivially easy and may inflate the all-pairs metric
 
 ### Dynamics
 
@@ -243,7 +308,7 @@ Notes:
 - `action_perturb_pred_shift_corr` is now computed over all perturbed samples, not just one averaged value per trial
 - `interpolation_monotonicity` is averaged over several anchors, so it is less sensitive to one lucky or unlucky context
 
-## 6. How To Read t-SNE Correctly
+## 7. How To Read t-SNE Correctly
 
 This is important.
 
@@ -262,7 +327,7 @@ Use it together with:
 - `knn_overlap`
 - `latent_state_step_corr`
 
-## 7. Environment-Specific Focus
+## 8. Environment-Specific Focus
 
 ### TwoRoom
 
@@ -290,7 +355,7 @@ Look for:
 - continuity across nearby arm poses
 - no latent shortcuts between distant joint configurations
 
-## 8. Dependencies
+## 9. Dependencies
 
 Main analysis:
 - no extra dependency beyond the training environment
@@ -301,7 +366,7 @@ Optional:
 
 If missing, the scripts fail with explicit messages.
 
-## 9. Suggested Workflow
+## 10. Suggested Workflow
 
 Recommended workflow before changing losses again:
 
