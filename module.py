@@ -287,24 +287,50 @@ def uniformity_loss(emb: torch.Tensor, t: float) -> torch.Tensor:
     return torch.exp(-t * sq_dists).mean().log()
 
 
-def infonce_loss(emb: torch.Tensor, temperature: float) -> torch.Tensor:
-    """InfoNCE-style uniformity loss over all non-identical batch elements.
+def infonce_loss(
+    pred: torch.Tensor, target: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    """Symmetric batch-wise InfoNCE for next-step prediction.
 
-    emb: (B, T, D) — unit vectors on S^{d-1}.
-    Treats every other element in the batch-time flattening as a negative and
-    minimises the normalized self-match probability.
+    pred: (B, T, D) predicted next-step embeddings
+    target: (B, T, D) ground-truth next-step embeddings
+
+    For each time step t and batch item b, this uses the aligned pair
+    (pred[b, t], target[b, t]) as the positive. The denominator contains:
+    - all cross-view samples at the same time step, and
+    - all same-view samples except self.
+
+    The loss is symmetric:
+      InfoNCE(pred, target) + InfoNCE(target, pred)
+    averaged over batch and time.
     """
-    z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
-    n = z.size(0)
-    if n < 2:
-        return z.new_tensor(0.0)
+    if pred.shape != target.shape:
+        raise ValueError(
+            f"pred and target must have the same shape, got {pred.shape} vs {target.shape}"
+        )
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature}")
 
-    logits = (z @ z.T) / temperature
-    logits = logits.masked_fill(
-        torch.eye(n, dtype=torch.bool, device=z.device), float("-inf")
-    )
-    log_denom = torch.logsumexp(logits, dim=-1)
-    return (-1.0 + log_denom).mean()
+    batch_size = pred.size(0)
+    if batch_size < 2:
+        return pred.new_tensor(0.0)
+
+    q = F.normalize(pred, dim=-1, eps=1e-8)
+    k = F.normalize(target, dim=-1, eps=1e-8)
+
+    labels = torch.arange(batch_size, device=pred.device)
+    labels = labels.unsqueeze(1).expand(-1, pred.size(1)).reshape(-1)
+    diag_mask = torch.eye(batch_size, dtype=torch.bool, device=pred.device).unsqueeze(1)
+    neg_inf = torch.finfo(q.dtype).min
+
+    def directional_loss(query: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        cross_logits = torch.einsum("btd,jtd->btj", query, other) / temperature
+        same_logits = torch.einsum("btd,jtd->btj", query, query) / temperature
+        same_logits = same_logits.masked_fill(diag_mask, neg_inf)
+        logits = torch.cat([cross_logits, same_logits], dim=-1)  # (B, T, 2B)
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels)
+
+    return 0.5 * (directional_loss(q, k) + directional_loss(k, q))
 
 
 class ARPredictor(nn.Module):
