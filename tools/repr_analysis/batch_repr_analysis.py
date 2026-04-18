@@ -400,6 +400,7 @@ def main():
             model_dir,
             result,
             outputs["emb"],
+            outputs["emb_raw"],
             outputs["state"],
             export_tsne=args.export_tsne,
             tsne_perplexity=args.tsne_perplexity,
