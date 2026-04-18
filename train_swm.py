@@ -153,7 +153,12 @@ def swm_forward(self, batch, stage, cfg):
         output["spread_loss"] = spread_loss(reg_emb, cfg.loss.spread.margin)
         output["reg_loss"] = output["spread_loss"]
     elif reg_type == "uniformity":
-        output["uniformity_loss"] = uniformity_loss(reg_emb, cfg.loss.uniformity.t)
+        output["uniformity_loss"] = uniformity_loss(
+            reg_emb,
+            cfg.loss.uniformity.t,
+            mode=cfg.loss.uniformity.get("mode", "all_pairs"),
+            temporal_exclusion=cfg.loss.uniformity.get("temporal_exclusion", 0),
+        )
         output["reg_loss"] = output["uniformity_loss"]
     elif reg_type == "infonce":
         output["infonce_loss"] = infonce_loss(

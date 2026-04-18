@@ -113,6 +113,27 @@ loss:
 That means new runs are self-consistent by default: if prediction is trained in
 raw space, predictor context is also fed from raw space unless you override it.
 
+Uniformity regularization now also supports masked pair selection:
+
+```yaml
+loss:
+  regularizer:
+    type: uniformity
+  uniformity:
+    t: 2.0
+    mode: all_pairs        # all_pairs | cross_window | temporal_masked
+    temporal_exclusion: 0  # only used by temporal_masked
+```
+
+Mode semantics:
+
+- `all_pairs`: current behaviour; every non-identical pair contributes
+- `cross_window`: only pairs from different batch items contribute
+- `temporal_masked`: same-window pairs with `|Δt| <= temporal_exclusion` are excluded
+
+This is useful when you want to stop the anti-collapse loss from pushing apart
+nearby temporal states that the predictor is supposed to keep aligned.
+
 For a hybrid `exp b2` style setup, keep the regularizer on normalized embeddings
 but score plans in raw predictor space:
 
@@ -166,6 +187,26 @@ wm:
     rollout_state_space: raw
     cost_space: raw
     cost_type: mse
+```
+
+For the current normalized-cosine mainline, a good parallel sweep is:
+
+```bash
+python train_swm.py data=pusht \
+  loss.regularizer.weight=0.2 \
+  loss.uniformity.t=4.0 \
+  loss.uniformity.mode=all_pairs
+
+python train_swm.py data=pusht \
+  loss.regularizer.weight=0.1 \
+  loss.uniformity.t=2.0 \
+  loss.uniformity.mode=cross_window
+
+python train_swm.py data=pusht \
+  loss.regularizer.weight=0.1 \
+  loss.uniformity.t=2.0 \
+  loss.uniformity.mode=temporal_masked \
+  loss.uniformity.temporal_exclusion=1
 ```
 
 Checkpoints are saved to `$STABLEWM_HOME/<subdir>/` upon completion.

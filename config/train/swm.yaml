@@ -90,5 +90,7 @@ loss:
     margin: 0.0 # m in max(0, mu_i^T mu_j - m)^2
   uniformity:
     t: 2.0 # Wang & Isola temperature in log E[exp(-t ||mu_i - mu_j||^2)]
+    mode: all_pairs # all_pairs, cross_window, or temporal_masked
+    temporal_exclusion: 0 # only used by temporal_masked; exclude same-window pairs with |Δt| <= k
   infonce:
     temperature: 0.1 # symmetric InfoNCE at each time step; positives are aligned pred/target pairs, negatives include cross-view batch items and same-view non-self items
