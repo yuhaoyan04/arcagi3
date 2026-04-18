@@ -81,6 +81,7 @@ loss:
   pred:
     type: cosine # cosine or mse
     space: normalized # normalized or raw
+    context_space: ${loss.pred.space} # predictor context space during training
   regularizer:
     type: uniformity # spread, uniformity, or infonce
     space: normalized # normalized or raw

@@ -176,6 +176,7 @@ class SphericalJEPA(JEPA):
         inference_cost_space: str = "normalized",
         inference_cost_type: str = "cosine",
         analysis_prediction_space: str = "normalized",
+        training_context_space: str = "normalized",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -183,6 +184,7 @@ class SphericalJEPA(JEPA):
         self.inference_cost_space = inference_cost_space.lower()
         self.inference_cost_type = inference_cost_type.lower()
         self.analysis_prediction_space = analysis_prediction_space.lower()
+        self.training_context_space = training_context_space.lower()
 
         valid_spaces = {"raw", "normalized", "sphere"}
         if self.inference_rollout_state_space not in valid_spaces:
@@ -198,6 +200,8 @@ class SphericalJEPA(JEPA):
             raise ValueError(
                 f"Unsupported analysis_prediction_space: {self.analysis_prediction_space}"
             )
+        if self.training_context_space not in valid_spaces:
+            raise ValueError(f"Unsupported training_context_space: {self.training_context_space}")
 
     def normalize_embeddings(self, emb):
         return F.normalize(emb, dim=-1, eps=1e-8)

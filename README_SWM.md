@@ -101,6 +101,18 @@ wm:
 
 This matches the original spherical SWM.
 
+Training now also records which latent space the predictor consumes during
+teacher-forced training. By default:
+
+```yaml
+loss:
+  pred:
+    context_space: ${loss.pred.space}
+```
+
+That means new runs are self-consistent by default: if prediction is trained in
+raw space, predictor context is also fed from raw space unless you override it.
+
 For a hybrid `exp b2` style setup, keep the regularizer on normalized embeddings
 but score plans in raw predictor space:
 
@@ -109,6 +121,7 @@ loss:
   pred:
     type: mse
     space: raw
+    context_space: raw
   regularizer:
     type: uniformity
     space: normalized
@@ -120,9 +133,40 @@ wm:
     cost_type: mse
 ```
 
-That configuration keeps autoregressive predictor inputs on the same normalized
-manifold seen during training, while avoiding a train/eval mismatch in the
-final planning cost.
+This is now an explicit hybrid ablation:
+
+- training prediction targets and predictor context are raw
+- the anti-collapse regularizer stays on normalized embeddings
+- planning still rolls out on normalized states
+
+Use this only if you intentionally want to test whether changing the terminal
+planning cost alone helps. It is not the main raw-dynamics baseline.
+
+For a fully raw-consistent setup, align training, rollout, and planning in raw
+space and consider removing projector BatchNorm so `emb_raw` does not collapse
+into an almost fixed-norm shell:
+
+```yaml
+encoder:
+  projection_head:
+    type: mlp
+    norm_fn: none
+
+loss:
+  pred:
+    type: mse
+    space: raw
+    context_space: raw
+  regularizer:
+    type: uniformity
+    space: normalized
+
+wm:
+  inference:
+    rollout_state_space: raw
+    cost_space: raw
+    cost_type: mse
+```
 
 Checkpoints are saved to `$STABLEWM_HOME/<subdir>/` upon completion.
 

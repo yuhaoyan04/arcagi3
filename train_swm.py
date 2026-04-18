@@ -89,6 +89,15 @@ def get_regularizer_tensor(output, *, space: str):
     raise ValueError(f"Unsupported loss.regularizer.space: {space}")
 
 
+def get_context_tensor(output, *, space: str):
+    space = space.lower()
+    if space == "raw":
+        return output["emb_raw"]
+    if space in {"normalized", "sphere"}:
+        return output["emb"]
+    raise ValueError(f"Unsupported loss.pred.context_space: {space}")
+
+
 def compute_pred_loss(pred: torch.Tensor, target: torch.Tensor, cfg) -> torch.Tensor:
     pred_type = cfg.loss.pred.get("type", "cosine").lower()
     if pred_type == "cosine":
@@ -112,16 +121,19 @@ def swm_forward(self, batch, stage, cfg):
     lambd = cfg.loss.regularizer.weight
     reg_space = cfg.loss.regularizer.get("space", "normalized")
     pred_space = cfg.loss.pred.get("space", "normalized")
+    context_space = cfg.loss.pred.get("context_space", pred_space)
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
     output = self.model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D), unit vectors
     act_emb = output["act_emb"]
 
-    ctx_emb = emb[:, :ctx_len]
+    # Make training-time autoregressive context explicit so raw-consistent
+    # experiments can feed predictor history from the same space used for the
+    # prediction target and planning rollout.
+    ctx_emb = get_context_tensor(output, space=context_space)[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
 
     pred_raw = self.model.predict_raw(ctx_emb, ctx_act)
@@ -224,6 +236,8 @@ def run(cfg):
     projector = build_projection_head(hidden_dim, embed_dim, head_cfg)
     pred_proj = build_projection_head(hidden_dim, embed_dim, head_cfg)
     inference_cfg = cfg.wm.get("inference", {})
+    pred_cfg = cfg.loss.get("pred", {})
+    training_context_space = pred_cfg.get("context_space", pred_cfg.get("space", "normalized"))
 
     world_model = SphericalJEPA(
         encoder=encoder,
@@ -235,6 +249,7 @@ def run(cfg):
         inference_cost_space=inference_cfg.get("cost_space", "normalized"),
         inference_cost_type=inference_cfg.get("cost_type", "cosine"),
         analysis_prediction_space=cfg.loss.pred.get("space", "normalized"),
+        training_context_space=training_context_space,
     )
 
     optimizers = {
