@@ -4,15 +4,11 @@ analyze_repr.py - Representation analysis for LeWM / SWM checkpoints.
 This script is designed to answer one question before changing losses again:
 "What is wrong (or right) about the representation?"
 
-It focuses on four analysis themes:
+It focuses on four analysis blocks:
 1. embedding      - anti-collapse / distribution health
 2. topology       - does latent geometry preserve state-space geometry
 3. dynamics       - does latent motion track true state motion
 4. action_effect  - does changing action create meaningful latent branching
-
-For hybrid models, embedding/topology are now reported in both normalized and
-raw spaces so it is easier to tell whether normalization itself is the
-bottleneck.
 
 Typical usage:
 
@@ -38,22 +34,11 @@ import stable_worldmodel as swm
 
 from utils import get_column_normalizer, get_img_preprocessor
 
-SECTION_ORDER = [
-    "meta",
-    "embedding",
-    "embedding_raw",
-    "topology",
-    "topology_raw",
-    "dynamics",
-    "action_effect",
-    "visualization",
-]
+SECTION_ORDER = ["meta", "embedding", "topology", "dynamics", "action_effect", "visualization"]
 SECTION_TITLES = {
     "meta": "Meta",
-    "embedding": "Embedding (Normalized)",
-    "embedding_raw": "Embedding (Raw)",
-    "topology": "Topology (Normalized)",
-    "topology_raw": "Topology (Raw)",
+    "embedding": "Embedding",
+    "topology": "Topology",
     "dynamics": "Dynamics",
     "action_effect": "Action Effect",
     "visualization": "Visualization",
@@ -285,12 +270,6 @@ METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
         },
     },
 }
-
-for raw_section, base_section in {"embedding_raw": "embedding", "topology_raw": "topology"}.items():
-    METRIC_SPECS[raw_section] = {
-        key: dict(spec) for key, spec in METRIC_SPECS[base_section].items()
-    }
-
 
 def load_model(ckpt_path: str, device: str = "cpu"):
     """Load an object checkpoint saved by ModelObjectCallBack."""
@@ -793,13 +772,10 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     dataset_l = dataset.lower()
     emb = result["embedding"]
     topo = result["topology"]
-    emb_raw = result.get("embedding_raw")
-    topo_raw = result.get("topology_raw")
     dyn = result["dynamics"]
     act = result["action_effect"]
     topo_corr = topo.get("distance_corr_cross_seq", topo["distance_corr"])
     topo_knn = topo.get("knn_overlap_cross_seq", topo["knn_overlap"])
-    topo_rank = topo.get("distance_rank_corr_cross_seq", topo["distance_rank_corr"])
 
     hints: List[str] = []
 
@@ -821,28 +797,6 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
         hints.append("Local neighborhoods disagree strongly between latent and state spaces.")
     elif topo_knn > 0.5:
         hints.append("Local neighborhoods are preserved fairly well.")
-
-    if isinstance(topo_raw, dict):
-        raw_topo_rank = topo_raw.get("distance_rank_corr_cross_seq", topo_raw["distance_rank_corr"])
-        if raw_topo_rank > topo_rank + 0.1:
-            hints.append(
-                "Raw latent geometry is noticeably stronger than normalized geometry; "
-                "if planning rolls out on normalized states, that branch may be the bottleneck."
-            )
-        elif raw_topo_rank < 0.1 and topo_rank < 0.1:
-            hints.append(
-                "Both normalized and raw latent geometry are weak; switching only the planning "
-                "space is unlikely to rescue performance."
-            )
-
-    if isinstance(emb_raw, dict):
-        raw_cos = emb_raw.get("inter_sample_cosine_mean", 0.0)
-        norm_cos = emb.get("inter_sample_cosine_mean", 0.0)
-        if norm_cos > 0.9 and raw_cos < 0.5:
-            hints.append(
-                "Normalized embeddings are much more concentrated than raw embeddings; "
-                "L2 normalization may be discarding useful amplitude or angular separation."
-            )
 
     if dyn["latent_state_step_corr"] < 0.2:
         hints.append("Latent motion is weakly aligned with true state motion; predictor/action conditioning is a good next target.")
@@ -984,16 +938,8 @@ def run_analysis(
             "inference_cost_type": getattr(model, "inference_cost_type", "cosine"),
         },
         "embedding": analyze_embedding(outputs["emb"]),
-        "embedding_raw": analyze_embedding(outputs["emb_raw"]),
         "topology": analyze_topology(
             outputs["emb"],
-            outputs["state"],
-            k=knn_k,
-            max_points=max_points,
-            seed=seed,
-        ),
-        "topology_raw": analyze_topology(
-            outputs["emb_raw"],
             outputs["state"],
             k=knn_k,
             max_points=max_points,
@@ -1044,7 +990,6 @@ def save_outputs(
     save_dir: Path,
     result: Dict[str, Dict[str, Any]],
     z: torch.Tensor,
-    z_raw: torch.Tensor,
     state: torch.Tensor,
     *,
     export_tsne: bool,
@@ -1053,15 +998,9 @@ def save_outputs(
 ):
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist both normalized and raw projections so downstream debugging can
-    # inspect exactly the same sampled states in each latent space.
     flat_z = z.reshape(-1, z.size(-1)).cpu()
     pca_proj = pca_projection(flat_z, out_dim=2)
     save_projection_rows(pca_proj, state, save_dir / "pca_projection.json")
-
-    flat_z_raw = z_raw.reshape(-1, z_raw.size(-1)).cpu()
-    pca_proj_raw = pca_projection(flat_z_raw, out_dim=2)
-    save_projection_rows(pca_proj_raw, state, save_dir / "pca_projection_raw.json")
 
     if export_tsne:
         try:
@@ -1076,22 +1015,12 @@ def save_outputs(
             result["visualization"]["tsne_perplexity"] = float(
                 min(tsne_perplexity, max(1.0, float((flat_z.size(0) - 1) // 3)))
             )
-
-            tsne_proj_raw = tsne_projection(
-                flat_z_raw,
-                out_dim=2,
-                perplexity=tsne_perplexity,
-                random_state=seed,
-            )
-            save_projection_rows(tsne_proj_raw, state, save_dir / "tsne_projection_raw.json")
         except Exception as exc:
             result.setdefault("visualization", {})["tsne_exported"] = False
             result["visualization"]["tsne_error"] = str(exc)
 
     with open(save_dir / "local_neighbors.json", "w") as f:
         json.dump(build_local_neighbor_report(z, state, k=8, n_anchors=12), f, indent=2)
-    with open(save_dir / "local_neighbors_raw.json", "w") as f:
-        json.dump(build_local_neighbor_report(z_raw, state, k=8, n_anchors=12), f, indent=2)
 
     with open(save_dir / "summary.json", "w") as f:
         json.dump(to_serializable(result), f, indent=2)
@@ -1152,7 +1081,6 @@ def main():
             save_dir,
             result,
             outputs["emb"],
-            outputs["emb_raw"],
             outputs["state"],
             export_tsne=args.export_tsne,
             tsne_perplexity=args.tsne_perplexity,

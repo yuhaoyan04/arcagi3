@@ -90,19 +90,14 @@ Notes on rigor:
 
 ## 2. Outputs
 
-`analyze_repr.py` prints the usual analysis blocks, and for hybrid models it
-also prints raw-space counterparts:
+`analyze_repr.py` prints four analysis blocks:
 
-- `Embedding (Normalized)`
+- `Embedding`
   - anti-collapse / distribution health
   - norms, per-dim std, inter-sample cosine, effective rank
-- `Embedding (Raw)`
-  - the same anti-collapse diagnostics on `emb_raw`
-- `Topology (Normalized)`
+- `Topology`
   - latent distance vs state distance
   - kNN overlap between latent space and state space
-- `Topology (Raw)`
-  - the same geometry diagnostics on `emb_raw`
 - `Dynamics`
   - whether latent motion tracks state motion
   - prediction error and pred-target cosine
@@ -122,16 +117,10 @@ When `--save-dir` is provided:
   Glossary describing what each metric means and how to use it.
 - `pca_projection.json`
   2D PCA projection of latent embeddings.
-- `pca_projection_raw.json`
-  2D PCA projection of raw latent embeddings.
 - `tsne_projection.json`
   2D t-SNE projection, only if exported successfully.
-- `tsne_projection_raw.json`
-  2D t-SNE projection of raw latent embeddings, only if exported successfully.
 - `local_neighbors.json`
   Anchor-by-anchor comparison of nearest neighbors in latent vs state space.
-- `local_neighbors_raw.json`
-  The same nearest-neighbor report in raw latent space.
 
 ## 3. Batch Analyze Multiple Runs
 
