@@ -306,3 +306,158 @@ So the current picture is:
 - post-L2 sliced spread alone: fail
 - BN + uniformity: **promising success**
 - SIGReg in Euclidean space: still the cleanest known robust baseline
+
+---
+
+## PushT Follow-up: Rollout-Space Consistency
+
+After the early collapse-focused Two-Room experiments, we ran a stricter PushT
+comparison to answer a different question:
+
+> when prediction is trained in one latent space, does planning also need to
+> roll out in that same space?
+
+The short answer from the current runs is **yes**.
+
+### PushT comparison snapshot
+
+| Model | Prediction training space | Rollout state space | Final cost space | PushT eval | Main representation takeaway |
+|---|---|---|---|---|---|
+| LeWM / SIGReg | raw MSE in Euclidean space | raw | raw MSE | **94** | Best global geometry and strongest action-driven latent motion |
+| SWM Exp A: BN + norm cosine + norm uniformity | normalized cosine | normalized | normalized cosine | **62** | Self-consistent rollout, but geometry is weaker than LeWM |
+| SWM Exp B2: BN + raw MSE + norm uniformity | raw MSE | normalized | raw MSE | **0** | Train / rollout mismatch; changing only final cost does not rescue planning |
+
+### Representation evidence from PushT
+
+The representation analysis makes the failure mode clearer:
+
+- Exp A (`BN + norm_cosine + norm_uniformity`) still has imperfect geometry, but
+  it retains usable local dynamics:
+  - `distance_rank_corr_cross_seq = 0.046`
+  - `knn_overlap_cross_seq = 0.225`
+  - `latent_state_step_corr = 0.365`
+  - `pred_target_cosine_mean = 0.994`
+- Exp B2 (`BN + raw_mse + norm_uniformity`, but `rollout_state_space=normalized`)
+  breaks much more severely:
+  - `distance_rank_corr_cross_seq = 0.045`
+  - `knn_overlap_cross_seq = 0.037`
+  - `latent_state_step_corr = -0.133`
+  - `pred_target_cosine_mean = 0.239`
+  - `mean_pred_shift_norm = 0.347`
+
+Interpretation:
+
+- Exp A is bad mainly because its geometry is weaker than LeWM, not because the
+  planner uses the wrong space.
+- Exp B2 is worse because the predictor is trained with `pred.space=raw`, but
+  planning still closes the autoregressive loop in `rollout_state_space=normalized`.
+- This shows that matching the **prediction-loss space** to the **rollout space**
+  matters more than matching only the final planning cost.
+
+### Additional raw-vs-normalized check
+
+We then extended `repr_analysis` to report both normalized and raw embedding /
+topology metrics for hybrid models.
+
+For the current BN-based raw-MSE run, raw and normalized geometry turned out to
+be almost identical. That means:
+
+- the failure is **not** mainly caused by the final `L2 normalize()`
+- `emb_raw` is already close to a fixed-norm thin shell, so raw space does not
+  preserve much extra amplitude information
+- with this architecture, switching only `cost_space` cannot rescue planning
+
+This points away from "cost mismatch only" and toward a stronger conclusion:
+
+> the prediction training space and the rollout state space should be the same
+> if we want stable multi-step planning.
+
+### Recommended consistent experiment lines
+
+The next comparison should therefore use two fully self-consistent branches
+rather than another hybrid.
+
+### Exp C1: spherical-consistent
+
+Use this to measure the best version of the spherical branch without changing
+its core geometry.
+
+```yaml
+encoder:
+  projection_head:
+    type: mlp
+    norm_fn: batchnorm1d
+
+loss:
+  pred:
+    type: cosine
+    space: normalized
+  regularizer:
+    type: uniformity
+    space: normalized
+    weight: 0.1
+
+wm:
+  inference:
+    rollout_state_space: normalized
+    cost_space: normalized
+    cost_type: cosine
+```
+
+Why this branch matters:
+
+- it keeps training, rollout, and planning in the same spherical space
+- it is the clean follow-up to Exp A
+- any remaining gap to LeWM can then be attributed to geometry quality, not
+  train / rollout inconsistency
+
+### Exp C2: raw-consistent
+
+Use this to test whether raw-MSE dynamics actually become useful once the
+predictor is trained and rolled out in the same raw space.
+
+```yaml
+encoder:
+  projection_head:
+    type: mlp
+    norm_fn: none
+
+loss:
+  pred:
+    type: mse
+    space: raw
+  regularizer:
+    type: uniformity
+    space: normalized
+    weight: 0.1
+
+wm:
+  inference:
+    rollout_state_space: raw
+    cost_space: raw
+    cost_type: mse
+```
+
+Why this branch matters:
+
+- it aligns prediction loss, rollout, and final planning cost in raw space
+- it directly tests the "raw dynamics" hypothesis instead of only changing the
+  terminal cost
+- removing `BatchNorm1d` from the projector is important here, because the
+  current BN-based raw run suggests `emb_raw` is already being compressed into a
+  near-shell geometry before planning ever sees it
+
+### Working hypothesis after PushT
+
+Current evidence supports the following rule of thumb:
+
+- `pred.space` should match `rollout_state_space`
+- `cost_space` should usually match them too
+- `regularizer.space` may differ if needed
+
+In other words, the important consistency is along the **dynamics path**:
+
+> prediction target space = autoregressive rollout space = planning space
+
+The current hybrid `raw pred + normalized rollout + raw cost` setup does not
+meet that requirement and should not be treated as the main raw-MSE baseline.
