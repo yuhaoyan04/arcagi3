@@ -20,6 +20,10 @@ The goal is not just to ask "did the model avoid collapse?", but to answer:
   Runs the same analysis for multiple checkpoints and writes aggregate tables.
 - [compare_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/compare_repr.py)
   Draws side-by-side comparison plots from two analysis directories.
+- [notebook_compare.py](/home/ag/projects/le-wm/tools/repr_analysis/notebook_compare.py)
+  Notebook-friendly helpers for both loading saved batch outputs and running live analysis directly from notebook cells.
+- [repr_compare_template.ipynb](/home/ag/projects/le-wm/tools/repr_analysis/repr_compare_template.ipynb)
+  Editable Jupyter notebook template for live comparison, table building, and visualization.
 - [run_repr_batch_example.sh](/home/ag/projects/le-wm/tools/repr_analysis/run_repr_batch_example.sh)
   Editable shell example that wraps the batch script for multi-model comparison.
 - [probe.py](/home/ag/projects/le-wm/probe.py)
@@ -41,6 +45,18 @@ Use `batch_repr_analysis.py` when:
 - you want to compare several models on the same dataset with identical settings
 - you want aggregate `CSV` / `Markdown` tables for later visualization
 - you want the script to also emit pairwise comparison plots
+
+Use `notebook_compare.py` + `repr_compare_template.ipynb` when:
+- you want to keep the final comparison loop in Jupyter instead of shell
+- you want to call `run_analysis()` directly from notebook cells instead of precomputing everything in bash
+- you want to edit the chosen metrics, eval scores, and model order inline
+- you want to save compact key-metric tables and plots for reports
+
+Notebook dependencies:
+
+- `pandas` for tables
+- `matplotlib` for charts
+- `torch` plus the project runtime if you want live analysis instead of read-only loading
 
 Use `compare_repr.py` when:
 - you want to compare `SIGReg` vs `BN+uniformity`
@@ -156,6 +172,53 @@ Batch outputs:
   the full printed logs and per-model metric dumps
 - `pairwise_compare/`
   optional side-by-side comparison plots plus `compare_manifest.json`
+
+### Notebook workflow
+
+If you prefer interactive comparison instead of shell loops, open:
+
+- [repr_compare_template.ipynb](/home/ag/projects/le-wm/tools/repr_analysis/repr_compare_template.ipynb)
+
+and edit:
+
+- `MODEL_SPECS`
+- `DATASET`
+- `ANALYSIS_SAVE_DIR`
+- `EXPORT_DIR`
+- `EVAL_SCORES`
+- `MODEL_ORDER`
+- `METRICS`
+
+The notebook can:
+
+- run `analyze_repr.run_analysis()` for each checkpoint directly in memory
+- optionally save each per-model analysis directory just like the CLI tool
+- build compact comparison tables from the returned records
+- render bar charts, heatmaps, and projection grids inline
+
+If you set `ANALYSIS_SAVE_DIR`, it also writes the usual per-model `summary.json`,
+projection JSONs, and local-neighbor reports.
+
+The notebook saves:
+
+- `key_metrics_wide.csv`
+- `key_metrics_long.csv`
+- `key_metrics_wide.html`
+- `key_metric_reference.csv`
+- `key_metric_reference.html`
+- `key_metrics_bars.png`
+- `key_metrics_heatmap.png`
+- optional projection grids such as `pca_projection_grid.png`
+
+The bar chart and heatmap now include inline metric notes so the reader can
+tell at a glance what each metric measures and what a weak value usually means.
+
+If you already have a saved `batch_repr_analysis.py` output directory, the same
+helper module still supports the older read-only workflow through:
+
+- `build_key_metric_table(...)`
+- `build_key_metric_long_table(...)`
+- `plot_projection_grid(...)`
 
 Pairwise compare rules:
 
