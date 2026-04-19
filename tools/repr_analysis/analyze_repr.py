@@ -21,9 +21,13 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import csv
+import itertools
 import json
+import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Tuple
+import re
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -345,6 +349,111 @@ METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
         },
     },
 }
+
+NON_TABLE_SECTIONS = {"meta", "interpretation", "visualization"}
+
+DEFAULT_KEY_METRICS: List[Dict[str, str]] = [
+    {
+        "group": "Embedding",
+        "metric_name": "embedding.effective_rank",
+        "label": "effective_rank",
+        "short_label": "rank",
+        "better": "higher",
+        "brief": "used latent directions",
+        "summary": "How many latent directions carry meaningful variance.",
+        "diagnosis": "Low means the code underuses capacity or is partially collapsed.",
+    },
+    {
+        "group": "Embedding",
+        "metric_name": "embedding.inter_sample_cosine_mean",
+        "label": "inter_sample_cosine_mean",
+        "short_label": "inter_cos",
+        "better": "lower_abs",
+        "brief": "sample spread",
+        "summary": "Average alignment between different samples.",
+        "diagnosis": "Large magnitude means samples crowd into similar directions instead of spreading cleanly.",
+    },
+    {
+        "group": "Prediction",
+        "metric_name": "prediction.pred_target_cosine_distance_mean",
+        "label": "pred_target_cosine_distance_mean",
+        "short_label": "pred_cos_dist",
+        "better": "lower",
+        "brief": "one-step predictor accuracy",
+        "summary": "Scale-free one-step prediction error.",
+        "diagnosis": "High means the predictor is missing the next latent target.",
+    },
+    {
+        "group": "Rollout",
+        "metric_name": "rollout.rollout_cosine_distance_last_mean",
+        "label": "rollout_cosine_distance_last_mean",
+        "short_label": "rollout_last",
+        "better": "lower",
+        "brief": "multi-step drift at horizon end",
+        "summary": "Autoregressive rollout error at the last tested horizon step.",
+        "diagnosis": "High means rollout drifts even if one-step prediction looks good.",
+    },
+    {
+        "group": "Planning",
+        "metric_name": "planning.cost_margin_mean",
+        "label": "cost_margin_mean",
+        "short_label": "cost_margin",
+        "better": "higher",
+        "brief": "expert vs random cost gap",
+        "summary": "Random-minus-expert cost gap under the model's own planner objective.",
+        "diagnosis": "Low or negative means the planner cost cannot separate good futures from random ones.",
+    },
+    {
+        "group": "Planning",
+        "metric_name": "planning.expert_beats_random_rate",
+        "label": "expert_beats_random_rate",
+        "short_label": "expert>random",
+        "better": "higher",
+        "brief": "planner preference rate",
+        "summary": "Fraction of random candidates whose cost is worse than the expert future.",
+        "diagnosis": "Low means the planner cannot reliably rank expert futures above random ones.",
+    },
+    {
+        "group": "Action Effect",
+        "metric_name": "action_effect.mean_pred_shift_norm",
+        "label": "mean_pred_shift_norm",
+        "short_label": "pred_shift",
+        "better": "higher",
+        "brief": "action-induced shift size",
+        "summary": "How much action perturbations move the predicted latent state.",
+        "diagnosis": "Too low means actions barely change the rollout, even if correlation looks decent.",
+    },
+    {
+        "group": "Action Effect",
+        "metric_name": "action_effect.action_perturb_pred_shift_corr",
+        "label": "action_perturb_pred_shift_corr",
+        "short_label": "act_shift_corr",
+        "better": "higher",
+        "brief": "action magnitude consistency",
+        "summary": "Whether larger action perturbations cause larger latent shifts.",
+        "diagnosis": "Low means action magnitude is not translated into latent dynamics reliably.",
+    },
+]
+
+
+def _require_pandas():
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError(
+            "This helper requires pandas. Install it with `pip install pandas`."
+        ) from exc
+    return pd
+
+
+def _require_matplotlib():
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError(
+            "This helper requires matplotlib. Install it with `pip install matplotlib`."
+        ) from exc
+    return plt
 
 
 def load_model(ckpt_path: str, device: str = "cpu"):
@@ -1094,6 +1203,559 @@ def format_analysis_report(result: Dict[str, Dict[str, Any]]) -> str:
     return "\n".join(chunks).lstrip()
 
 
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip()).strip("._-")
+    return slug or "model"
+
+
+def make_unique_slug(label: str, used: set[str]) -> str:
+    base = slugify(label)
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def parse_model_spec(spec: str | Sequence[str]) -> Tuple[str, str]:
+    if isinstance(spec, str):
+        if "=" in spec:
+            label, ckpt = spec.split("=", 1)
+            label = label.strip()
+            ckpt = ckpt.strip()
+            if not label or not ckpt:
+                raise ValueError(f"Invalid model spec: {spec}")
+            return label, ckpt
+        ckpt = spec.strip()
+        if not ckpt:
+            raise ValueError("Empty model spec.")
+        return Path(ckpt).stem, ckpt
+
+    if len(spec) != 2:
+        raise ValueError(f"Expected (label, ckpt) pair, got: {spec}")
+    label, ckpt = str(spec[0]).strip(), str(spec[1]).strip()
+    if not label or not ckpt:
+        raise ValueError(f"Invalid model spec: {spec}")
+    return label, ckpt
+
+
+def parse_compare_pair(spec: str) -> Tuple[str, str]:
+    if "=" in spec:
+        left, right = spec.split("=", 1)
+    elif "," in spec:
+        left, right = spec.split(",", 1)
+    else:
+        raise ValueError(f"Invalid compare pair spec: {spec}")
+
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        raise ValueError(f"Invalid compare pair spec: {spec}")
+    return left, right
+
+
+def metric_table_entries(result: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, Any]]:
+    return [
+        (section, key, value)
+        for section, key, value in metric_entries(result)
+        if section not in NON_TABLE_SECTIONS
+    ]
+
+
+def records_to_metrics_wide(records: Sequence[Mapping[str, Any]]):
+    pd = _require_pandas()
+    rows: List[Dict[str, Any]] = []
+    for record in records:
+        row: Dict[str, Any] = {
+            "model_label": record["label"],
+            "model_slug": record.get("slug", slugify(record["label"])),
+            "analysis_dir": record.get("analysis_dir", ""),
+            "ckpt": record["result"]["meta"]["ckpt"],
+        }
+        for section, key, value in metric_table_entries(record["result"]):
+            row[f"{section}.{key}"] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _apply_model_order(df, model_order: Sequence[str] | None):
+    if not model_order:
+        return df
+    pd = _require_pandas()
+    order_map = {label: idx for idx, label in enumerate(model_order)}
+    tmp = df.copy()
+    tmp["_model_order"] = tmp["model_label"].map(order_map).fillna(len(order_map))
+    tmp = tmp.sort_values(["_model_order", "model_label"]).drop(columns="_model_order")
+    return pd.DataFrame(tmp)
+
+
+def _key_metric_specs(metrics: Sequence[Mapping[str, str]] | None) -> List[Mapping[str, str]]:
+    return list(metrics or DEFAULT_KEY_METRICS)
+
+
+def _wide_table_from_df(
+    wide,
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    eval_scores: Mapping[str, float] | None = None,
+    model_order: Sequence[str] | None = None,
+    include_analysis_dir: bool = False,
+):
+    pd = _require_pandas()
+    specs = _key_metric_specs(metrics)
+    table = wide.copy()
+
+    if eval_scores is not None:
+        table["eval_score"] = table["model_label"].map(eval_scores)
+
+    columns = ["model_label"]
+    rename_map: Dict[str, str] = {}
+    if include_analysis_dir and "analysis_dir" in table.columns:
+        columns.append("analysis_dir")
+    if "eval_score" in table.columns:
+        columns.append("eval_score")
+
+    for spec in specs:
+        metric_name = spec["metric_name"]
+        if metric_name not in table.columns:
+            table[metric_name] = float("nan")
+        columns.append(metric_name)
+        rename_map[metric_name] = spec["label"]
+
+    out = table[columns].rename(columns=rename_map)
+    out = _apply_model_order(out, model_order)
+    return pd.DataFrame(out)
+
+
+def _long_table_from_df(
+    wide,
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    eval_scores: Mapping[str, float] | None = None,
+    model_order: Sequence[str] | None = None,
+):
+    pd = _require_pandas()
+    specs = _key_metric_specs(metrics)
+    table = _wide_table_from_df(
+        wide,
+        metrics=specs,
+        eval_scores=eval_scores,
+        model_order=model_order,
+        include_analysis_dir=True,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for spec in specs:
+        label = spec["label"]
+        for _, row in table.iterrows():
+            rows.append(
+                {
+                    "model_label": row["model_label"],
+                    "analysis_dir": row.get("analysis_dir", ""),
+                    "group": spec["group"],
+                    "metric": label,
+                    "metric_name": spec["metric_name"],
+                    "better": spec["better"],
+                    "value": row.get(label),
+                    "eval_score": row.get("eval_score"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_key_metric_table_from_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    eval_scores: Mapping[str, float] | None = None,
+    model_order: Sequence[str] | None = None,
+    include_analysis_dir: bool = False,
+):
+    wide = records_to_metrics_wide(records)
+    return _wide_table_from_df(
+        wide,
+        metrics=metrics,
+        eval_scores=eval_scores,
+        model_order=model_order,
+        include_analysis_dir=include_analysis_dir,
+    )
+
+
+def build_key_metric_long_table_from_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    eval_scores: Mapping[str, float] | None = None,
+    model_order: Sequence[str] | None = None,
+):
+    wide = records_to_metrics_wide(records)
+    return _long_table_from_df(
+        wide,
+        metrics=metrics,
+        eval_scores=eval_scores,
+        model_order=model_order,
+    )
+
+
+def build_metric_reference_table(
+    metrics: Sequence[Mapping[str, str]] | None = None,
+):
+    pd = _require_pandas()
+    rows = []
+    for spec in _key_metric_specs(metrics):
+        rows.append(
+            {
+                "group": spec["group"],
+                "metric": spec["label"],
+                "short_label": spec.get("short_label", spec["label"]),
+                "better": _metric_goal_text(spec.get("better", "higher")),
+                "summary": spec.get("summary", ""),
+                "diagnosis": spec.get("diagnosis", ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def save_key_metric_tables(
+    wide_table,
+    long_table,
+    *,
+    output_dir: str | Path,
+    stem: str = "key_metrics",
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wide_csv = output_dir / f"{stem}_wide.csv"
+    long_csv = output_dir / f"{stem}_long.csv"
+    html_path = output_dir / f"{stem}_wide.html"
+
+    wide_table.to_csv(wide_csv, index=False)
+    long_table.to_csv(long_csv, index=False)
+    html_path.write_text(wide_table.to_html(index=False))
+    return {
+        "wide_csv": wide_csv,
+        "long_csv": long_csv,
+        "wide_html": html_path,
+    }
+
+
+def save_metric_reference_table(
+    table,
+    *,
+    output_dir: str | Path,
+    stem: str = "key_metric_reference",
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / f"{stem}.csv"
+    html_path = output_dir / f"{stem}.html"
+    table.to_csv(csv_path, index=False)
+    html_path.write_text(table.to_html(index=False))
+    return {
+        "csv": csv_path,
+        "html": html_path,
+    }
+
+
+def _normalize_metric(values, better: str):
+    clean = [float(v) for v in values if v == v]
+    if not clean:
+        return [float("nan")] * len(values)
+
+    if better == "lower_abs":
+        transformed = [abs(float(v)) if v == v else float("nan") for v in values]
+        clean = [v for v in transformed if v == v]
+        lo, hi = min(clean), max(clean)
+        if math.isclose(lo, hi):
+            return [0.5 if v == v else float("nan") for v in transformed]
+        return [1.0 - ((v - lo) / (hi - lo)) if v == v else float("nan") for v in transformed]
+
+    lo, hi = min(clean), max(clean)
+    if math.isclose(lo, hi):
+        return [0.5 if v == v else float("nan") for v in values]
+
+    if better == "lower":
+        return [1.0 - ((float(v) - lo) / (hi - lo)) if v == v else float("nan") for v in values]
+
+    return [((float(v) - lo) / (hi - lo)) if v == v else float("nan") for v in values]
+
+
+def _metric_arrow(better: str) -> str:
+    return "↓" if better in {"lower", "lower_abs"} else "↑"
+
+
+def _metric_goal_text(better: str) -> str:
+    if better == "lower":
+        return "lower is better"
+    if better == "lower_abs":
+        return "closer to 0 is better"
+    return "higher is better"
+
+
+def _metric_title(spec: Mapping[str, str]) -> str:
+    short_label = spec.get("short_label", spec["label"])
+    brief = spec.get("brief", spec.get("summary", ""))
+    return (
+        f"{spec['group']} | {short_label} {_metric_arrow(spec.get('better', 'higher'))}\n"
+        f"{brief}"
+    )
+
+
+def _metric_note_lines(specs: Sequence[Mapping[str, str]], *, notes_per_line: int = 2) -> List[str]:
+    entries = [
+        (
+            f"{spec.get('short_label', spec['label'])} {_metric_arrow(spec.get('better', 'higher'))}: "
+            f"{spec.get('summary', '')} "
+            f"{spec.get('diagnosis', '')}"
+        ).strip()
+        for spec in specs
+    ]
+    lines: List[str] = []
+    for idx in range(0, len(entries), notes_per_line):
+        lines.append("  |  ".join(entries[idx : idx + notes_per_line]))
+    return lines
+
+
+def _apply_metric_notes(fig, specs: Sequence[Mapping[str, str]]):
+    lines = _metric_note_lines(specs)
+    if not lines:
+        return
+    bottom_margin = min(0.38, 0.08 + 0.045 * len(lines))
+    fig.tight_layout(rect=[0, bottom_margin, 1, 1])
+    fig.text(
+        0.01,
+        0.01,
+        "\n".join(lines),
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        family="monospace",
+    )
+
+
+def plot_metric_bars(
+    table,
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    output: str | Path | None = None,
+    ncols: int = 3,
+    annotate: bool = True,
+    figsize_scale: float = 4.0,
+):
+    plt = _require_matplotlib()
+    specs = [spec for spec in _key_metric_specs(metrics) if spec["label"] in table.columns]
+    if not specs:
+        raise ValueError("No requested metrics are present in the table.")
+    nplots = len(specs)
+    ncols = max(1, min(ncols, nplots))
+    nrows = (nplots + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(figsize_scale * ncols, 3.8 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    x_labels = table["model_label"].tolist()
+    for ax, spec in zip(axes_flat, specs):
+        col = spec["label"]
+        values = table[col].tolist()
+        bars = ax.bar(x_labels, values, color="#4C78A8")
+        ax.set_title(_metric_title(spec))
+        ax.tick_params(axis="x", rotation=30)
+        if annotate:
+            for bar, value in zip(bars, values):
+                if value == value:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2.0,
+                        bar.get_height(),
+                        f"{value:.3f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=9,
+                    )
+
+    for ax in axes_flat[nplots:]:
+        ax.axis("off")
+
+    _apply_metric_notes(fig, specs)
+    if output is not None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=200, bbox_inches="tight")
+    return fig
+
+
+def plot_metric_heatmap(
+    table,
+    *,
+    metrics: Sequence[Mapping[str, str]] | None = None,
+    output: str | Path | None = None,
+    annotate: bool = True,
+):
+    plt = _require_matplotlib()
+    specs = [spec for spec in _key_metric_specs(metrics) if spec["label"] in table.columns]
+    if not specs:
+        raise ValueError("No requested metrics are present in the table.")
+    metric_labels = [
+        f"{spec.get('short_label', spec['label'])}\n{_metric_arrow(spec.get('better', 'higher'))}"
+        for spec in specs
+    ]
+    normalized = [
+        _normalize_metric(table[spec["label"]].tolist(), spec.get("better", "higher"))
+        for spec in specs
+    ]
+
+    fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(metric_labels)), max(3, 0.7 * len(table))))
+    im = ax.imshow(list(zip(*normalized)), aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    ax.set_xticks(range(len(metric_labels)))
+    ax.set_xticklabels(metric_labels, rotation=35, ha="right")
+    ax.set_yticks(range(len(table)))
+    ax.set_yticklabels(table["model_label"].tolist())
+    ax.set_title("Direction-aware metric heatmap")
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+
+    if annotate:
+        for row_idx in range(len(table)):
+            for col_idx, spec in enumerate(specs):
+                value = table.iloc[row_idx][spec["label"]]
+                if value == value:
+                    ax.text(col_idx, row_idx, f"{value:.3f}", ha="center", va="center", color="white", fontsize=8)
+
+    _apply_metric_notes(fig, specs)
+    if output is not None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=200, bbox_inches="tight")
+    return fig
+
+
+def _projection_rows_from_tensor(proj: torch.Tensor, reference_state: torch.Tensor | None, *, seq_len: int) -> List[Dict[str, float]]:
+    flat_ref = reference_state.reshape(-1, reference_state.size(-1)).cpu() if reference_state is not None else None
+    rows: List[Dict[str, float]] = []
+    for idx in range(proj.size(0)):
+        row: Dict[str, float] = {
+            "seq_id": float(idx // seq_len),
+            "time_id": float(idx % seq_len),
+            "x": float(proj[idx, 0]),
+            "y": float(proj[idx, 1]),
+        }
+        if flat_ref is not None:
+            for dim in range(flat_ref.size(1)):
+                row[f"state_{dim}"] = float(flat_ref[idx, dim])
+        rows.append(row)
+    return rows
+
+
+def _projection_rows_from_outputs(
+    outputs: Mapping[str, Any],
+    *,
+    projection: str,
+    tsne_perplexity: float = 30.0,
+    seed: int = 3072,
+) -> List[Dict[str, float]]:
+    flat_z = outputs["emb"].reshape(-1, outputs["emb"].size(-1)).cpu()
+    if projection == "pca":
+        proj = pca_projection(flat_z, out_dim=2)
+    elif projection == "tsne":
+        proj = tsne_projection(
+            flat_z,
+            out_dim=2,
+            perplexity=tsne_perplexity,
+            random_state=seed,
+        )
+    else:
+        raise ValueError(f"Unknown projection type: {projection}")
+    return _projection_rows_from_tensor(
+        proj,
+        outputs.get("state"),
+        seq_len=outputs["emb"].size(1),
+    )
+
+
+def _resolve_projection_color_key(rows: List[Mapping[str, float]], dim: int) -> str:
+    preferred = f"state_{dim}"
+    if preferred in rows[0]:
+        return preferred
+    fallback = "time_id" if dim == 0 else "seq_id" if dim == 1 else None
+    if fallback and fallback in rows[0]:
+        return fallback
+    raise KeyError(
+        f"{preferred} not found in projection rows, and no fallback color key is available."
+    )
+
+
+def plot_projection_grid_from_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    model_labels: Sequence[str] | None = None,
+    projection: str = "pca",
+    color_dims: Sequence[int] = (0, 1),
+    output: str | Path | None = None,
+    alpha: float = 0.7,
+    size: float = 6.0,
+    tsne_perplexity: float = 30.0,
+    seed: int = 3072,
+):
+    plt = _require_matplotlib()
+    model_labels = list(model_labels or [record["label"] for record in records])
+    if not model_labels:
+        raise ValueError("No model labels available for projection plotting.")
+    record_by_label = {record["label"]: record for record in records}
+    rows_by_label = {
+        label: _projection_rows_from_outputs(
+            record_by_label[label]["outputs"],
+            projection=projection,
+            tsne_perplexity=tsne_perplexity,
+            seed=seed,
+        )
+        for label in model_labels
+    }
+
+    fig, axes = plt.subplots(
+        len(model_labels),
+        len(color_dims),
+        figsize=(6 * len(color_dims), 4 * len(model_labels)),
+        squeeze=False,
+    )
+
+    for col_idx, dim in enumerate(color_dims):
+        key_by_label = {
+            label: _resolve_projection_color_key(rows_by_label[label], dim) for label in model_labels
+        }
+        values = [
+            row[key_by_label[label]]
+            for label in model_labels
+            for row in rows_by_label[label]
+        ]
+        vmin, vmax = min(values), max(values)
+
+        for row_idx, label in enumerate(model_labels):
+            rows = rows_by_label[label]
+            key = key_by_label[label]
+            ax = axes[row_idx][col_idx]
+            sc = ax.scatter(
+                [row["x"] for row in rows],
+                [row["y"] for row in rows],
+                c=[row[key] for row in rows],
+                s=size,
+                alpha=alpha,
+                cmap="viridis",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            ax.set_title(f"{label} | {projection.upper()} | {key}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.tight_layout()
+    if output is not None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output, dpi=200, bbox_inches="tight")
+    return fig
+
+
 def run_analysis(
     *,
     ckpt: str,
@@ -1281,9 +1943,396 @@ def save_outputs(
     save_metric_guide(save_dir / "metric_guide.json")
 
 
+class TeeLogger:
+    """Mirror progress to stdout and to an in-memory log file."""
+
+    def __init__(self):
+        self.lines: List[str] = []
+
+    def log(self, message: str):
+        print(message)
+        self.lines.append(message)
+
+    def block(self, message: str):
+        print(f"\n{message}")
+        self.lines.append(message)
+
+    def save(self, path: Path):
+        path.write_text("\n".join(self.lines).rstrip() + "\n")
+
+
+def projection_plot_name(projection: str, color_dims: Sequence[int]) -> str:
+    dims = "_".join(f"state{dim}" for dim in color_dims)
+    return f"{projection}_{dims}.png"
+
+
+def compare_plot_name(left_slug: str, right_slug: str, projection: str, color_dims: Sequence[int]) -> str:
+    dims = "_".join(f"state{dim}" for dim in color_dims)
+    return f"{left_slug}__{right_slug}_{projection}_{dims}.png"
+
+
+def write_wide_csv(path: Path, rows: List[Dict[str, Any]]):
+    fieldnames: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_long_csv(path: Path, rows: List[Dict[str, Any]]):
+    if not rows:
+        raise ValueError("No rows to save in long CSV.")
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def markdown_cell(value: Any) -> str:
+    return format_metric_value(value).replace("|", "\\|").replace("\n", " ")
+
+
+def write_markdown_report(path: Path, model_records: List[Dict[str, Any]]):
+    labels = [record["label"] for record in model_records]
+    lines = [
+        "# Representation Batch Analysis",
+        "",
+        "This file compares the scalar metrics from multiple representation-analysis runs.",
+        "",
+        "## Models",
+        "",
+        "| label | slug | analysis_dir | ckpt |",
+        "| --- | --- | --- | --- |",
+    ]
+    for record in model_records:
+        lines.append(
+            f"| {markdown_cell(record['label'])} | {markdown_cell(record['slug'])} | "
+            f"{markdown_cell(record['analysis_dir'])} | {markdown_cell(record['result']['meta']['ckpt'])} |"
+        )
+
+    for section in SECTION_ORDER:
+        if section in {"meta", "visualization"}:
+            continue
+        if not any(section in record["result"] for record in model_records):
+            continue
+
+        lines.extend([
+            "",
+            f"## {SECTION_TITLES.get(section, section.title())}",
+            "",
+            "| metric | better | summary | " + " | ".join(markdown_cell(label) for label in labels) + " |",
+            "| --- | --- | --- | " + " | ".join("---" for _ in labels) + " |",
+        ])
+
+        metric_keys: List[str] = []
+        for record in model_records:
+            metrics = record["result"].get(section, {})
+            if not isinstance(metrics, dict):
+                continue
+            preferred_keys = list(METRIC_SPECS.get(section, {}).keys())
+            extra_keys = [key for key in metrics.keys() if key not in preferred_keys]
+            for key in preferred_keys + extra_keys:
+                if key in metrics and key not in metric_keys:
+                    metric_keys.append(key)
+
+        for key in metric_keys:
+            spec = metric_spec(section, key)
+            row = [
+                markdown_cell(key),
+                markdown_cell(spec.get("better", "context")),
+                markdown_cell(spec.get("summary", "")),
+            ]
+            for record in model_records:
+                value = record["result"].get(section, {}).get(key, "")
+                row.append(markdown_cell(value))
+            lines.append("| " + " | ".join(row) + " |")
+
+    path.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def resolve_compare_pairs(
+    *,
+    compare_all_pairs: bool,
+    compare_pair_specs: Sequence[str],
+    compare_projections: Sequence[str],
+    model_records: List[Dict[str, Any]],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    by_label = {record["label"]: record for record in model_records}
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    seen: set[Tuple[str, str]] = set()
+
+    if compare_all_pairs:
+        requested = [(left["label"], right["label"]) for left, right in itertools.combinations(model_records, 2)]
+    elif compare_pair_specs:
+        requested = [parse_compare_pair(spec) for spec in compare_pair_specs]
+    elif len(model_records) == 2 and compare_projections:
+        requested = [(model_records[0]["label"], model_records[1]["label"])]
+    else:
+        requested = []
+
+    for left_label, right_label in requested:
+        if left_label not in by_label:
+            raise KeyError(f"Unknown compare pair label: {left_label}")
+        if right_label not in by_label:
+            raise KeyError(f"Unknown compare pair label: {right_label}")
+        if left_label == right_label:
+            raise ValueError(f"Compare pair must use two different labels: {left_label}")
+        left = by_label[left_label]
+        right = by_label[right_label]
+        pair_key = tuple(sorted((left["slug"], right["slug"])))
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
+        pairs.append((left, right))
+    return pairs
+
+
+def render_pairwise_comparisons(
+    *,
+    root_dir: Path,
+    model_records: List[Dict[str, Any]],
+    compare_projections: Sequence[str],
+    compare_pair_specs: Sequence[str],
+    compare_all_pairs: bool,
+    color_dims: Sequence[int],
+    alpha: float,
+    size: float,
+    title: str,
+    logger: TeeLogger,
+) -> List[Dict[str, str]]:
+    compare_pairs = resolve_compare_pairs(
+        compare_all_pairs=compare_all_pairs,
+        compare_pair_specs=compare_pair_specs,
+        compare_projections=compare_projections,
+        model_records=model_records,
+    )
+    if not compare_pairs or not compare_projections:
+        return []
+
+    from tools.repr_analysis.compare_repr import load_rows as load_compare_rows
+    from tools.repr_analysis.compare_repr import load_summary, save_comparison_plot
+
+    compare_dir = root_dir / "pairwise_compare"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    manifests: List[Dict[str, str]] = []
+
+    for left, right in compare_pairs:
+        for projection in compare_projections:
+            left_rows = load_compare_rows(Path(left["analysis_dir"]), projection)
+            right_rows = load_compare_rows(Path(right["analysis_dir"]), projection)
+            left_summary = load_summary(Path(left["analysis_dir"]))
+            right_summary = load_summary(Path(right["analysis_dir"]))
+            output = compare_dir / compare_plot_name(left["slug"], right["slug"], projection, color_dims)
+            save_comparison_plot(
+                left_rows=left_rows,
+                right_rows=right_rows,
+                left_summary=left_summary,
+                right_summary=right_summary,
+                left_label=left["label"],
+                right_label=right["label"],
+                projection=projection,
+                color_dims=list(color_dims),
+                output=output,
+                title=title,
+                alpha=alpha,
+                size=size,
+            )
+            logger.log(
+                f"[analyze_repr] saved compare plot: {output} "
+                f"({left['label']} vs {right['label']}, {projection})"
+            )
+            manifests.append({
+                "left_label": left["label"],
+                "right_label": right["label"],
+                "left_slug": left["slug"],
+                "right_slug": right["slug"],
+                "projection": projection,
+                "output": str(output),
+            })
+
+    with open(compare_dir / "compare_manifest.json", "w") as f:
+        json.dump(to_serializable(manifests), f, indent=2)
+    return manifests
+
+
+def run_batch_analysis(
+    *,
+    model_specs: Sequence[str | Sequence[str]],
+    dataset: str,
+    save_dir: str | Path,
+    state_key: str | None,
+    frameskip: int,
+    img_size: int,
+    n_sequences: int,
+    future_steps: int,
+    max_points: int,
+    knn_k: int,
+    action_trials: int,
+    planning_random_trials: int,
+    interp_steps: int,
+    perturb_scale: float,
+    seed: int,
+    device: str,
+    export_tsne: bool,
+    tsne_perplexity: float,
+    plot_projections: Sequence[str],
+    compare_projections: Sequence[str],
+    compare_pair_specs: Sequence[str],
+    compare_all_pairs: bool,
+    color_dims: Sequence[int],
+    alpha: float,
+    size: float,
+) -> List[Dict[str, Any]]:
+    if "tsne" in plot_projections and not export_tsne:
+        raise ValueError("`plot_projections=['tsne']` requires `export_tsne=True`.")
+    if "tsne" in compare_projections and not export_tsne:
+        raise ValueError("`compare_projections=['tsne']` requires `export_tsne=True`.")
+    if compare_pair_specs and not compare_projections:
+        raise ValueError("`compare_pair_specs` requires `compare_projections`.")
+    if compare_all_pairs and not compare_projections:
+        raise ValueError("`compare_all_pairs=True` requires `compare_projections`.")
+
+    root_dir = Path(save_dir)
+    root_dir.mkdir(parents=True, exist_ok=True)
+    save_metric_guide(root_dir / "metric_guide.json")
+
+    from tools.repr_analysis.plot_repr import load_rows, save_projection_plot
+
+    logger = TeeLogger()
+    parsed_specs = [parse_model_spec(spec) for spec in model_specs]
+    used_slugs: set[str] = set()
+    model_records: List[Dict[str, Any]] = []
+
+    logger.log(f"[analyze_repr] models={len(parsed_specs)} save_dir={root_dir}")
+    for index, (label, ckpt) in enumerate(parsed_specs, start=1):
+        slug = make_unique_slug(label, used_slugs)
+        model_dir = root_dir / slug
+
+        logger.log(f"\n[analyze_repr] ({index}/{len(parsed_specs)}) {label}")
+        result, outputs = run_analysis(
+            ckpt=ckpt,
+            dataset=dataset,
+            state_key=state_key,
+            frameskip=frameskip,
+            img_size=img_size,
+            n_sequences=n_sequences,
+            future_steps=future_steps,
+            max_points=max_points,
+            knn_k=knn_k,
+            action_trials=action_trials,
+            planning_random_trials=planning_random_trials,
+            interp_steps=interp_steps,
+            perturb_scale=perturb_scale,
+            seed=seed,
+            device=device,
+            log=logger.log,
+        )
+
+        save_outputs(
+            model_dir,
+            result,
+            outputs["emb"],
+            outputs.get("state"),
+            export_tsne=export_tsne,
+            tsne_perplexity=tsne_perplexity,
+            seed=seed,
+        )
+        logger.log(f"[analyze_repr] saved analysis dir: {model_dir}")
+
+        for projection in plot_projections:
+            projection_json = model_dir / f"{projection}_projection.json"
+            if not projection_json.exists():
+                logger.log(f"[analyze_repr] skip {projection} plot for {label}: {projection_json.name} not found")
+                continue
+            plot_path = model_dir / projection_plot_name(projection, color_dims)
+            save_projection_plot(
+                load_rows(projection_json),
+                output=plot_path,
+                color_dims=list(color_dims),
+                title=f"{label} {projection.upper()}",
+                alpha=alpha,
+                size=size,
+            )
+            logger.log(f"[analyze_repr] saved {projection} plot: {plot_path}")
+
+        logger.block(format_analysis_report(result))
+        model_records.append({
+            "label": label,
+            "slug": slug,
+            "analysis_dir": str(model_dir),
+            "result": result,
+        })
+
+    wide_rows: List[Dict[str, Any]] = []
+    long_rows: List[Dict[str, Any]] = []
+    for record in model_records:
+        wide_row: Dict[str, Any] = {
+            "model_label": record["label"],
+            "model_slug": record["slug"],
+            "analysis_dir": record["analysis_dir"],
+        }
+        for section, key, value in metric_table_entries(record["result"]):
+            metric_name = f"{section}.{key}"
+            wide_row[metric_name] = value
+            spec = metric_spec(section, key)
+            long_rows.append({
+                "model_label": record["label"],
+                "model_slug": record["slug"],
+                "analysis_dir": record["analysis_dir"],
+                "section": section,
+                "metric": key,
+                "metric_name": metric_name,
+                "value": value,
+                "better": spec.get("better", "context"),
+                "summary": spec.get("summary", ""),
+                "use": spec.get("use", ""),
+            })
+        wide_rows.append(wide_row)
+
+    compare_manifest = render_pairwise_comparisons(
+        root_dir=root_dir,
+        model_records=model_records,
+        compare_projections=compare_projections,
+        compare_pair_specs=compare_pair_specs,
+        compare_all_pairs=compare_all_pairs,
+        color_dims=color_dims,
+        alpha=alpha,
+        size=size,
+        title=f"{dataset} Representation Comparison",
+        logger=logger,
+    )
+
+    wide_csv = root_dir / "metrics_wide.csv"
+    long_csv = root_dir / "metrics_long.csv"
+    markdown_report = root_dir / "metrics_table.md"
+    batch_summary_json = root_dir / "batch_summary.json"
+    batch_log = root_dir / "batch_report.txt"
+
+    write_wide_csv(wide_csv, wide_rows)
+    write_long_csv(long_csv, long_rows)
+    write_markdown_report(markdown_report, model_records)
+    with open(batch_summary_json, "w") as f:
+        json.dump(to_serializable({"models": model_records, "compare_manifest": compare_manifest}), f, indent=2)
+
+    logger.log(f"\n[analyze_repr] saved wide table: {wide_csv}")
+    logger.log(f"[analyze_repr] saved long table: {long_csv}")
+    logger.log(f"[analyze_repr] saved markdown table: {markdown_report}")
+    if compare_manifest:
+        logger.log(f"[analyze_repr] saved pairwise compares: {root_dir / 'pairwise_compare'}")
+    logger.log(f"[analyze_repr] saved batch summary: {batch_summary_json}")
+    logger.save(batch_log)
+    print(f"[analyze_repr] saved batch log: {batch_log}")
+    return model_records
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="Object checkpoint path")
+    parser.add_argument("--ckpt", type=str, default=None, help="Single-model object checkpoint path")
+    parser.add_argument("--model", action="append", default=[], help="Repeatable `label=ckpt_path` entry for batch mode.")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name/path")
     parser.add_argument(
         "--state-key",
@@ -1305,6 +2354,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--export-tsne", action="store_true", help="Export t-SNE projection if sklearn is installed")
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
+    parser.add_argument(
+        "--plot-projections",
+        type=str,
+        nargs="*",
+        default=[],
+        choices=["pca", "tsne"],
+        help="Projection types to render as per-model PNG files in batch mode.",
+    )
+    parser.add_argument(
+        "--compare-projections",
+        type=str,
+        nargs="*",
+        default=[],
+        choices=["pca", "tsne"],
+        help="Projection types to render as pairwise comparison PNG files in batch mode.",
+    )
+    parser.add_argument(
+        "--compare-pair",
+        action="append",
+        default=[],
+        help="Optional pair spec using model labels, e.g. `SIGReg=BN+uniformity`. Repeatable.",
+    )
+    parser.add_argument(
+        "--compare-all-pairs",
+        action="store_true",
+        help="If set, render comparison plots for every model pair in batch mode.",
+    )
+    parser.add_argument("--color-dims", type=int, nargs="+", default=[0], help="State dimensions used for plot colors.")
+    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--size", type=float, default=6.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return parser
 
@@ -1312,9 +2391,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    result, outputs = run_analysis(
-        ckpt=args.ckpt,
-        dataset=args.dataset,
+    if bool(args.ckpt) == bool(args.model):
+        parser.error("Provide exactly one of `--ckpt` or `--model`.")
+
+    if args.export_tsne:
+        print(
+            "\n[analyze_repr] t-SNE requested: this is for local-neighborhood visualisation only; "
+            "do not use it as a quantitative judge of planning signal or global latent quality."
+        )
+
+    common_kwargs = dict(
         state_key=args.state_key,
         frameskip=args.frameskip,
         img_size=args.img_size,
@@ -1328,14 +2414,34 @@ def main():
         perturb_scale=args.perturb_scale,
         seed=args.seed,
         device=args.device,
-        log=print,
     )
 
-    if args.export_tsne:
-        print(
-            "\n[analyze_repr] t-SNE requested: this is for local-neighborhood visualisation only; "
-            "do not use it as a quantitative judge of planning signal or global latent quality."
+    if args.model:
+        if not args.save_dir:
+            parser.error("Batch mode requires `--save-dir`.")
+        run_batch_analysis(
+            model_specs=args.model,
+            dataset=args.dataset,
+            save_dir=args.save_dir,
+            export_tsne=args.export_tsne,
+            tsne_perplexity=args.tsne_perplexity,
+            plot_projections=args.plot_projections,
+            compare_projections=args.compare_projections,
+            compare_pair_specs=args.compare_pair,
+            compare_all_pairs=args.compare_all_pairs,
+            color_dims=args.color_dims,
+            alpha=args.alpha,
+            size=args.size,
+            **common_kwargs,
         )
+        return
+
+    result, outputs = run_analysis(
+        ckpt=args.ckpt,
+        dataset=args.dataset,
+        log=print,
+        **common_kwargs,
+    )
 
     if args.save_dir:
         save_dir = Path(args.save_dir)

@@ -61,7 +61,7 @@ resolve_ckpt_path() {
 }
 
 cmd=(
-  "${PYTHON_BIN}" -m tools.repr_analysis.batch_repr_analysis
+  "${PYTHON_BIN}" -m tools.repr_analysis.analyze_repr
   --dataset "${DATASET_PATH}"
   --state-key "${STATE_KEY}"
   --save-dir "${BATCH_SAVE_DIR}"

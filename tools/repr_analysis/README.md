@@ -15,17 +15,13 @@ The goal is not just to ask "did the model avoid collapse?", but to answer:
 ## Files
 
 - [analyze_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/analyze_repr.py)
-  Runs quantitative analysis on one checkpoint and one dataset.
+  Single entrypoint for one or many checkpoints. It runs the analysis, saves outputs, and also exposes notebook-friendly table / plotting helpers.
 - [plot_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/plot_repr.py)
   Plots one PCA / t-SNE projection export.
-- [batch_repr_analysis.py](/home/ag/projects/le-wm/tools/repr_analysis/batch_repr_analysis.py)
-  Runs the same analysis for multiple checkpoints and writes aggregate tables.
 - [compare_repr.py](/home/ag/projects/le-wm/tools/repr_analysis/compare_repr.py)
   Draws side-by-side comparison plots from two analysis directories.
-- [notebook_compare.py](/home/ag/projects/le-wm/tools/repr_analysis/notebook_compare.py)
-  Notebook-friendly helpers for both loading saved batch outputs and running live analysis directly from notebook cells.
 - [repr_compare_template.ipynb](/home/ag/projects/le-wm/tools/repr_analysis/repr_compare_template.ipynb)
-  Editable Jupyter notebook template for live comparison, table building, and visualization.
+  Editable Jupyter notebook template that imports only `analyze_repr.py`.
 - [run_repr_batch_example.sh](/home/ag/projects/le-wm/tools/repr_analysis/run_repr_batch_example.sh)
   Editable shell example that wraps the batch script for multi-model comparison.
 - [probe.py](/home/ag/projects/le-wm/probe.py)
@@ -37,18 +33,13 @@ Use `analyze_repr.py` when:
 - you want quantitative diagnostics before changing losses
 - you want to inspect one model on one environment
 - you want JSON outputs for later plotting or comparison
+- you want one CLI for both single-model and multi-model analysis
 
 Use `plot_repr.py` when:
 - you already ran `analyze_repr.py`
 - you want a quick visualization similar to Figure 9 in the paper
 
-Use `batch_repr_analysis.py` when:
-- you want one Python entrypoint instead of a long bash script
-- you want to compare several models on the same dataset with identical settings
-- you want aggregate `CSV` / `Markdown` tables for later visualization
-- you want the script to also emit pairwise comparison plots
-
-Use `notebook_compare.py` + `repr_compare_template.ipynb` when:
+Use `repr_compare_template.ipynb` when:
 - you want to keep the final comparison loop in Jupyter instead of shell
 - you want to call `run_analysis()` directly from notebook cells instead of precomputing everything in bash
 - you want to edit the chosen metrics, eval scores, and model order inline
@@ -149,13 +140,12 @@ When `--save-dir` is provided:
 
 ## 3. Batch Analyze Multiple Runs
 
-When you want a single Python command to replace a manual bash loop, use
-`batch_repr_analysis.py`.
+`analyze_repr.py` also supports batch mode.
 
 Example:
 
 ```bash
-python -m tools.repr_analysis.batch_repr_analysis \
+python -m tools.repr_analysis.analyze_repr \
   --dataset /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/pusht_expert_train \
   --future-steps 8 \
   --save-dir /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/repr_analysis/pusht_batch_compare \
@@ -221,13 +211,6 @@ The notebook saves:
 
 The bar chart and heatmap now include inline metric notes so the reader can
 tell at a glance what each metric measures and what a weak value usually means.
-
-If you already have a saved `batch_repr_analysis.py` output directory, the same
-helper module still supports the older read-only workflow through:
-
-- `build_key_metric_table(...)`
-- `build_key_metric_long_table(...)`
-- `plot_projection_grid(...)`
 
 Pairwise compare rules:
 
