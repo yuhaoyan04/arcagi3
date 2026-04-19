@@ -1,22 +1,21 @@
 """
 analyze_repr.py - Representation analysis for LeWM / SWM checkpoints.
 
-This script is designed to answer one question before changing losses again:
-"What is wrong (or right) about the representation?"
+The analysis now treats representation quality in three layers:
 
-It focuses on four analysis blocks:
-1. embedding      - anti-collapse / distribution health
-2. topology       - does latent geometry preserve state-space geometry
-3. dynamics       - does latent motion track true state motion
-4. action_effect  - does changing action create meaningful latent branching
+1. embedding
+   anti-collapse / capacity usage
+2. prediction and rollout
+   can the model predict the next latent, and does autoregressive rollout drift
+   when driven by real action sequences from the dataset
+3. planning
+   does the model's own cost function assign lower cost to expert futures than
+   to random action futures for the same start and goal
 
-Typical usage:
-
-  python analyze_repr.py \
-      --ckpt /path/to/model_object.pt \
-      --dataset tworoom \
-      --state-key proprio \
-      --save-dir /tmp/repr_analysis_tworoom
+Optional:
+4. reference_probe
+   if `state_key` is provided, compare latent geometry to that external proxy.
+   This is a probe only, not the main judge of representation quality.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -34,165 +33,209 @@ import stable_worldmodel as swm
 
 from utils import get_column_normalizer, get_img_preprocessor
 
-SECTION_ORDER = ["meta", "embedding", "topology", "dynamics", "action_effect", "visualization"]
+SECTION_ORDER = [
+    "meta",
+    "embedding",
+    "prediction",
+    "rollout",
+    "planning",
+    "action_effect",
+    "reference_probe",
+    "visualization",
+]
 SECTION_TITLES = {
     "meta": "Meta",
     "embedding": "Embedding",
-    "topology": "Topology",
-    "dynamics": "Dynamics",
+    "prediction": "Prediction",
+    "rollout": "Rollout",
+    "planning": "Planning",
     "action_effect": "Action Effect",
+    "reference_probe": "Reference Probe",
     "visualization": "Visualization",
 }
 
-# Metric metadata is used in three places:
-# 1. to keep the code self-documenting,
-# 2. to help the batch-analysis script write readable tables,
-# 3. to make later metric additions explicit instead of burying meaning in names.
 METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
     "embedding": {
         "n_embeddings": {
             "better": "context",
             "summary": "Number of flattened latent points included in the analysis.",
-            "use": "Mainly for sanity checking that two runs are compared on the same sample count.",
+            "use": "Sanity check that different runs were analyzed on the same point budget.",
         },
         "dim": {
             "better": "context",
             "summary": "Latent embedding dimensionality.",
-            "use": "Only a context field; it does not measure representation quality by itself.",
+            "use": "Context only; this is not a quality metric by itself.",
         },
         "norm_mean": {
             "better": "context",
             "summary": "Average L2 norm of latent embeddings.",
-            "use": "Check whether a method uses norm as part of the code. This matters before comparing scale-dependent metrics like latent step size or prediction error.",
+            "use": "Useful before comparing any scale-dependent latent error or shift metrics.",
         },
         "norm_std": {
             "better": "context",
             "summary": "Standard deviation of latent embedding norms.",
-            "use": "Near-zero values often mean the method constrains embeddings onto a thin shell or unit sphere.",
+            "use": "Near-zero values often indicate a thin-shell or unit-sphere representation.",
         },
         "dim_std_mean": {
             "better": "higher",
             "summary": "Average standard deviation across latent dimensions.",
-            "use": "Quick anti-collapse signal. Low values mean many dimensions barely move across samples.",
+            "use": "Quick anti-collapse check. Low values mean many coordinates barely move.",
         },
         "dim_std_min": {
             "better": "higher",
             "summary": "Smallest per-dimension standard deviation.",
-            "use": "Detects dead or nearly dead latent directions.",
+            "use": "Detects dead latent directions.",
         },
         "dim_std_max": {
             "better": "context",
             "summary": "Largest per-dimension standard deviation.",
-            "use": "Helps detect whether a few dimensions dominate the representation.",
+            "use": "Helps spot a representation dominated by only a few coordinates.",
         },
         "inter_sample_cosine_mean": {
             "better": "lower_abs",
             "summary": "Average pairwise cosine similarity between different samples.",
-            "use": "Collapse check. Values drifting toward 1 mean samples point in nearly the same direction.",
+            "use": "Collapse check. Values drifting toward 1 mean different samples point in nearly the same direction.",
         },
         "inter_sample_cosine_std": {
             "better": "context",
             "summary": "Spread of pairwise cosine similarities.",
-            "use": "Useful together with the mean to tell whether the latent cloud is uniform or anisotropic.",
+            "use": "Read together with the mean to tell whether the cloud is uniform or anisotropic.",
         },
         "effective_rank": {
             "better": "higher",
             "summary": "Entropy-based effective rank of the centered embedding matrix.",
-            "use": "Interpret it as the number of directions that carry meaningful variance, not the raw embedding size. It is a stronger capacity check than just looking at per-dimension std.",
+            "use": "Approximate number of directions that actually carry variance, not just the nominal embedding size.",
         },
     },
-    "topology": {
-        "n_points": {
+    "prediction": {
+        "n_prediction_windows": {
             "better": "context",
-            "summary": "Number of flattened points used for topology analysis.",
-            "use": "Sanity check that two runs used the same comparison budget.",
+            "summary": "Number of teacher-forced prediction windows evaluated.",
+            "use": "Sanity check that two runs used the same evaluation budget.",
         },
-        "k": {
+        "prediction_horizon": {
             "better": "context",
-            "summary": "Neighborhood size used in kNN overlap metrics.",
-            "use": "Context field for interpreting `knn_overlap` values.",
-        },
-        "distance_corr": {
-            "better": "higher",
-            "summary": "Pearson correlation between latent-space and state-space pairwise distances.",
-            "use": "Answers whether global distances are approximately linearly related. Good for spotting geometry collapse or large-scale distortions.",
-        },
-        "distance_rank_corr": {
-            "better": "higher",
-            "summary": "Rank correlation between latent-space and state-space pairwise distances.",
-            "use": "This is the `_rank` metric. It only asks whether distance ordering is preserved, so it remains informative when one method rescales or normalizes embeddings nonlinearly.",
-        },
-        "knn_overlap": {
-            "better": "higher",
-            "summary": "Average overlap between latent and state k-nearest neighbors.",
-            "use": "Local-geometry metric. High values mean nearby states stay nearby after encoding.",
-        },
-        "distance_corr_cross_seq": {
-            "better": "higher",
-            "summary": "Distance correlation computed only on pairs from different sampled sequences.",
-            "use": "This is the `_cross_seq` version. It removes easy within-sequence temporal neighbors that can inflate metrics even when cross-trajectory geometry is wrong.",
-        },
-        "distance_rank_corr_cross_seq": {
-            "better": "higher",
-            "summary": "Rank correlation on cross-sequence pairs only.",
-            "use": "Often the most trustworthy topology metric when judging planning geometry. It asks whether the model preserves which cross-trajectory states are closer or farther, without being fooled by temporal adjacency.",
-        },
-        "knn_overlap_cross_seq": {
-            "better": "higher",
-            "summary": "kNN overlap after excluding same-sequence candidates.",
-            "use": "Stricter local-geometry check. Useful when adjacent frames in one rollout are trivially close in both latent and state space.",
-        },
-    },
-    "dynamics": {
-        "latent_step_mean": {
-            "better": "context",
-            "summary": "Average one-step latent displacement.",
-            "use": "Only compare directly when embedding norms are comparable. Otherwise treat it as within-method context.",
-        },
-        "latent_step_std": {
-            "better": "context",
-            "summary": "Standard deviation of one-step latent displacement.",
-            "use": "Tells you whether the latent dynamics vary across easy vs hard transitions.",
-        },
-        "state_step_mean": {
-            "better": "context",
-            "summary": "Average one-step state displacement in the proxy state space.",
-            "use": "Reference scale for interpreting latent step statistics.",
-        },
-        "state_step_std": {
-            "better": "context",
-            "summary": "Standard deviation of one-step state displacement.",
-            "use": "Reference spread for transition magnitudes in the sampled batch.",
-        },
-        "latent_state_step_corr": {
-            "better": "higher",
-            "summary": "Correlation between latent step size and state step size.",
-            "use": "Checks whether larger physical changes also look larger in latent space. Good for action sensitivity and predictor calibration.",
+            "summary": "Number of one-step prediction windows per sampled sequence.",
+            "use": "Context for interpreting the aggregate prediction metrics.",
         },
         "pred_error_mean": {
             "better": "lower",
-            "summary": "Average Euclidean prediction error between one-step prediction and target embedding.",
-            "use": "Useful within one method family, but scale-dependent. Always read it together with `norm_mean` or cosine metrics before comparing across methods.",
+            "summary": "Average Euclidean one-step prediction error in the model's analysis space.",
+            "use": "Within-family predictor metric. Read together with norm statistics before comparing across very different latent scales.",
         },
         "pred_error_std": {
             "better": "lower",
-            "summary": "Standard deviation of Euclidean prediction error.",
-            "use": "Helps tell whether the predictor is consistently wrong or fails only on certain transitions.",
+            "summary": "Standard deviation of one-step Euclidean prediction error.",
+            "use": "Tells whether the predictor is consistently wrong or fails only on certain transitions.",
         },
         "pred_target_cosine_mean": {
             "better": "higher",
             "summary": "Average cosine similarity between one-step prediction and target embedding.",
-            "use": "Scale-free predictor metric. Particularly useful when one method enforces unit-norm embeddings.",
+            "use": "Scale-free one-step prediction metric.",
         },
         "pred_target_cosine_std": {
             "better": "lower",
             "summary": "Standard deviation of prediction-target cosine similarity.",
-            "use": "Low spread means prediction quality is more consistent across transitions.",
+            "use": "Lower values mean prediction quality is more consistent across windows.",
         },
         "pred_target_cosine_distance_mean": {
             "better": "lower",
             "summary": "Average cosine distance between one-step prediction and target embedding.",
-            "use": "Equivalent information to cosine similarity but in a lower-is-better form that is sometimes easier to compare in tables.",
+            "use": "Lower-is-better version of one-step cosine prediction quality.",
+        },
+    },
+    "rollout": {
+        "rollout_horizon": {
+            "better": "context",
+            "summary": "Number of future steps rolled out autoregressively with real dataset actions.",
+            "use": "Context for interpreting rollout drift metrics.",
+        },
+        "rollout_error_mean": {
+            "better": "lower",
+            "summary": "Average autoregressive rollout error against encoded future embeddings.",
+            "use": "Primary self-consistency metric for multi-step latent prediction.",
+        },
+        "rollout_error_std": {
+            "better": "lower",
+            "summary": "Standard deviation of autoregressive rollout error.",
+            "use": "Large spread means rollout quality depends strongly on the sampled future window.",
+        },
+        "rollout_error_last_mean": {
+            "better": "lower",
+            "summary": "Average rollout error at the last predicted horizon step.",
+            "use": "Direct measure of compounding error at the longest horizon tested.",
+        },
+        "rollout_cosine_distance_mean": {
+            "better": "lower",
+            "summary": "Average cosine distance between rollout predictions and encoded future targets.",
+            "use": "Scale-free autoregressive drift metric.",
+        },
+        "rollout_cosine_distance_last_mean": {
+            "better": "lower",
+            "summary": "Cosine distance at the last rollout step.",
+            "use": "Useful when deciding whether a model stays coherent over the whole planning horizon.",
+        },
+        "rollout_error_growth": {
+            "better": "lower",
+            "summary": "Ratio of last-step rollout error to first-step rollout error.",
+            "use": "Values far above 1 mean compounding error grows quickly over time.",
+        },
+    },
+    "planning": {
+        "planning_horizon": {
+            "better": "context",
+            "summary": "Number of future actions optimized or compared when probing planning cost.",
+            "use": "Context for the planning-signal metrics below.",
+        },
+        "random_action_trials": {
+            "better": "context",
+            "summary": "Number of random action futures sampled per sequence for the cost probe.",
+            "use": "Sanity check for the stability of expert-vs-random comparisons.",
+        },
+        "expert_cost_mean": {
+            "better": "lower",
+            "summary": "Average model cost assigned to the dataset future action sequence.",
+            "use": "Reference cost for the expert/action-from-data future.",
+        },
+        "expert_cost_std": {
+            "better": "lower",
+            "summary": "Standard deviation of expert cost across sampled sequences.",
+            "use": "High variance means the cost signal is unstable across contexts.",
+        },
+        "random_cost_mean": {
+            "better": "context",
+            "summary": "Average model cost assigned to random future action sequences.",
+            "use": "This should be higher than expert cost if the planner signal is useful.",
+        },
+        "random_cost_std": {
+            "better": "context",
+            "summary": "Standard deviation of random-sequence costs.",
+            "use": "Helps judge whether the random baseline is narrow or very noisy.",
+        },
+        "best_random_cost_mean": {
+            "better": "context",
+            "summary": "Average best (lowest) random cost per sequence.",
+            "use": "Harder comparison than the random mean. Expert should usually beat this too.",
+        },
+        "cost_margin_mean": {
+            "better": "higher",
+            "summary": "Average random-minus-expert cost gap.",
+            "use": "Primary planning-signal metric. Higher means the model separates expert futures from random futures.",
+        },
+        "cost_margin_std": {
+            "better": "lower",
+            "summary": "Standard deviation of the random-minus-expert cost gap.",
+            "use": "High spread means the planning signal is unreliable across start-goal pairs.",
+        },
+        "expert_beats_random_rate": {
+            "better": "higher",
+            "summary": "Fraction of random candidates whose cost is higher than the expert candidate.",
+            "use": "Easy-to-read planning signal. Near 1 means expert usually ranks better than random.",
+        },
+        "expert_beats_best_random_rate": {
+            "better": "higher",
+            "summary": "Fraction of sequences where expert beats even the best random candidate.",
+            "use": "Stricter planning metric. Useful when random mean is easy to beat but best-random is not.",
         },
     },
     "action_effect": {
@@ -224,17 +267,17 @@ METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
         "mean_pred_shift_norm": {
             "better": "context",
             "summary": "Average norm of the prediction change caused by action perturbations.",
-            "use": "Within-method measure of how much action can move the prediction. It is scale-dependent if embeddings use different norms.",
+            "use": "Within-method measure of how much action can move the prediction.",
         },
         "action_perturb_pred_shift_corr": {
             "better": "higher",
             "summary": "Correlation between perturbation magnitude and prediction-shift magnitude.",
-            "use": "Tests whether larger action changes reliably cause larger latent changes. This is stronger than just asking whether any shift happened at all.",
+            "use": "Checks whether larger action changes reliably create larger latent changes.",
         },
         "interpolation_endpoint_shift": {
             "better": "context",
             "summary": "Average latent distance from the interpolation start to the interpolation end.",
-            "use": "Context field for how much the chosen action interpolation actually moves the prediction.",
+            "use": "Context for how much the chosen interpolation actually moves the prediction.",
         },
         "interpolation_endpoint_shift_std": {
             "better": "lower",
@@ -252,11 +295,43 @@ METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
             "use": "Low spread means the smoothness pattern is stable across contexts.",
         },
     },
+    "reference_probe": {
+        "reference_state_key": {
+            "better": "context",
+            "summary": "Dataset key used as an external geometry proxy.",
+            "use": "Reference only. This probe does not define the ground truth planning geometry.",
+        },
+        "n_points": {
+            "better": "context",
+            "summary": "Number of flattened points used for the reference probe.",
+            "use": "Sanity check that two runs used the same comparison budget.",
+        },
+        "k": {
+            "better": "context",
+            "summary": "Neighborhood size used in the reference kNN overlap metric.",
+            "use": "Context field for interpreting `knn_overlap` values.",
+        },
+        "distance_rank_corr_cross_seq": {
+            "better": "higher",
+            "summary": "Rank correlation between latent and reference-proxy distances on cross-sequence pairs.",
+            "use": "Optional probe only. Useful if the chosen reference state is known to be task-meaningful.",
+        },
+        "knn_overlap_cross_seq": {
+            "better": "higher",
+            "summary": "kNN overlap between latent and reference-proxy neighborhoods after excluding same-sequence points.",
+            "use": "Optional local-geometry probe against the external state proxy.",
+        },
+        "latent_reference_step_corr": {
+            "better": "higher",
+            "summary": "Correlation between latent step size and reference-proxy step size.",
+            "use": "Optional motion-alignment probe if the reference state is trustworthy.",
+        },
+    },
     "visualization": {
         "tsne_exported": {
             "better": "context",
             "summary": "Whether t-SNE export succeeded.",
-            "use": "Context only. t-SNE is for visual inspection, not for quantitative selection.",
+            "use": "Context only. t-SNE is for visual inspection, not for quantitative model selection.",
         },
         "tsne_perplexity": {
             "better": "context",
@@ -271,8 +346,8 @@ METRIC_SPECS: Dict[str, Dict[str, Dict[str, str]]] = {
     },
 }
 
+
 def load_model(ckpt_path: str, device: str = "cpu"):
-    """Load an object checkpoint saved by ModelObjectCallBack."""
     model = torch.load(ckpt_path, map_location=device, weights_only=False)
     if hasattr(model, "model"):
         model = model.model
@@ -286,62 +361,97 @@ def infer_history_size(model) -> int:
     return int(predictor.pos_embedding.shape[1])
 
 
+def resolve_space_name(space: str | None, default: str = "normalized") -> str:
+    space = (space or default).lower()
+    return "normalized" if space == "sphere" else space
+
+
+def get_embedding_space(outputs: Mapping[str, torch.Tensor], space: str) -> torch.Tensor:
+    space = resolve_space_name(space)
+    if space == "raw":
+        return outputs["emb_raw"]
+    if space == "normalized":
+        return outputs["emb"]
+    raise ValueError(f"Unsupported embedding space: {space}")
+
+
+def get_model_spaces(model) -> Dict[str, str]:
+    analysis_space = resolve_space_name(getattr(model, "analysis_prediction_space", "normalized"))
+    context_space = resolve_space_name(getattr(model, "training_context_space", analysis_space))
+    rollout_space = resolve_space_name(getattr(model, "inference_rollout_state_space", "normalized"))
+    cost_space = resolve_space_name(getattr(model, "inference_cost_space", "normalized"))
+    cost_type = getattr(model, "inference_cost_type", "cosine").lower()
+    return {
+        "analysis_prediction_space": analysis_space,
+        "training_context_space": context_space,
+        "inference_rollout_state_space": rollout_space,
+        "inference_cost_space": cost_space,
+        "inference_cost_type": cost_type,
+    }
+
+
 def load_dataset_samples(
     *,
     dataset_name: str,
-    state_key: str,
+    state_key: str | None,
     n_sequences: int,
     history_size: int,
+    future_steps: int,
     frameskip: int,
     img_size: int,
     seed: int,
     device: str,
 ):
-    """Load a random subset of sequences with the same preprocessing as training."""
-    num_steps = history_size + 1
+    num_steps = history_size + future_steps
+    keys_to_load = ["pixels", "action"]
+    if state_key:
+        keys_to_load.append(state_key)
+
     ds = swm.data.HDF5Dataset(
         name=dataset_name,
         num_steps=num_steps,
         frameskip=frameskip,
-        keys_to_load=["pixels", "action", state_key],
+        keys_to_load=keys_to_load,
         transform=None,
     )
-    ds.transform = spt.data.transforms.Compose(
+
+    transforms = [
         get_img_preprocessor("pixels", "pixels", img_size),
         get_column_normalizer(ds, "action", "action"),
-        get_column_normalizer(ds, state_key, state_key),
-    )
+    ]
+    if state_key:
+        transforms.append(get_column_normalizer(ds, state_key, state_key))
+    ds.transform = spt.data.transforms.Compose(*transforms)
 
     g = torch.Generator().manual_seed(seed)
     indices = torch.randperm(len(ds), generator=g)[:n_sequences].tolist()
     samples = [ds[i] for i in indices]
 
-    batch = {
+    batch: Dict[str, torch.Tensor] = {
         "pixels": torch.stack([s["pixels"] for s in samples]).to(device),
         "action": torch.nan_to_num(torch.stack([s["action"] for s in samples]), 0.0).to(device),
-        "state": torch.stack([s[state_key] for s in samples]).to(device),
     }
+    if state_key:
+        batch["state"] = torch.stack([s[state_key] for s in samples]).to(device)
     return batch
 
 
 @torch.no_grad()
 def encode_sequences(model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Encode sequences and compute one-step predictions."""
     info = model.encode({"pixels": batch["pixels"], "action": batch["action"]})
     emb = info["emb"]
+    emb_raw = info.get("emb_raw", emb)
     act_emb = info["act_emb"]
-
-    ctx_len = infer_history_size(model)
-    pred = model.predict(emb[:, :ctx_len], act_emb[:, :ctx_len])
-    tgt = emb[:, 1:]
-
-    return {
+    outputs = {
         "emb": emb,
-        "pred": pred,
-        "tgt": tgt,
+        "emb_raw": emb_raw,
+        "act_emb": act_emb,
+        "pixels": batch["pixels"],
         "action": batch["action"],
-        "state": batch["state"],
     }
+    if "state" in batch:
+        outputs["state"] = batch["state"]
+    return outputs
 
 
 def exclude_diagonal(mat: torch.Tensor) -> torch.Tensor:
@@ -362,15 +472,6 @@ def pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
-    """Rank correlation for geometry comparisons.
-
-    Pearson correlation on distances is still useful, but it assumes a roughly
-    linear relationship between latent and state distances. The `_rank` metric
-    relaxes that assumption: it only checks whether the ordering of distances is
-    preserved. This is especially helpful when comparing methods that impose
-    different latent scales, such as unit-sphere losses vs unconstrained codes.
-    """
-
     def rankdata(v: torch.Tensor) -> torch.Tensor:
         order = torch.argsort(v)
         ranks = torch.empty_like(order, dtype=torch.float32)
@@ -383,14 +484,6 @@ def spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def effective_rank(z: torch.Tensor) -> float:
-    """Entropy-based effective rank of the centered embedding matrix.
-
-    The raw embedding dimension answers "how many coordinates exist?".
-    Effective rank answers "how many directions actually carry variance?".
-    A 192-dim embedding can still behave like a 20-dim code if almost all
-    variance is concentrated in a small subspace.
-    """
-
     z = z - z.mean(0, keepdim=True)
     singular_values = torch.linalg.svdvals(z)
     power = singular_values.square()
@@ -407,36 +500,29 @@ def flatten_sequence_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 def flattened_sequence_ids(x: torch.Tensor) -> torch.Tensor:
-    """Return the sequence id for each flattened time step."""
     b, t = x.shape[:2]
     return torch.arange(b).repeat_interleave(t)
 
 
 def sample_flat_points(
     z: torch.Tensor,
-    state: torch.Tensor,
+    ref: torch.Tensor,
     *,
     max_points: int,
     seed: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Randomly subsample flattened points for topology analysis.
-
-    Random subsampling avoids a subtle bias from taking the first N flattened
-    points, which would over-represent early sequences and time steps.
-    """
-
     flat_z = flatten_sequence_tensor(z)
-    flat_s = flatten_sequence_tensor(state)
-    seq_ids = flattened_sequence_ids(state)
+    flat_ref = flatten_sequence_tensor(ref)
+    seq_ids = flattened_sequence_ids(ref)
 
     n_total = flat_z.shape[0]
     n_keep = min(max_points, n_total)
     if n_keep == n_total:
-        return flat_z, flat_s, seq_ids
+        return flat_z, flat_ref, seq_ids
 
     g = torch.Generator().manual_seed(seed)
     indices = torch.randperm(n_total, generator=g)[:n_keep]
-    return flat_z[indices], flat_s[indices], seq_ids[indices]
+    return flat_z[indices], flat_ref[indices], seq_ids[indices]
 
 
 def pca_projection(z: torch.Tensor, out_dim: int = 2) -> torch.Tensor:
@@ -454,12 +540,6 @@ def tsne_projection(
     random_state: int = 3072,
     pca_dim: int = 32,
 ) -> torch.Tensor:
-    """Optional t-SNE projection for visual inspection of local neighborhoods.
-
-    This stays separate from the quantitative analysis because t-SNE is useful
-    for visualizing local structure, but not reliable for judging global
-    geometry or absolute cluster spacing.
-    """
     try:
         from sklearn.manifold import TSNE
     except ImportError as exc:
@@ -488,40 +568,7 @@ def tsne_projection(
     return torch.from_numpy(proj)
 
 
-def knn_overlap(
-    a_dist: torch.Tensor,
-    b_dist: torch.Tensor,
-    k: int,
-    *,
-    invalid_mask: torch.Tensor | None = None,
-) -> float:
-    """Average neighbor overlap between two distance matrices.
-
-    This is a local-geometry metric. Unlike distance correlations, it does not
-    care about exact metric scale; it only asks whether each point keeps roughly
-    the same nearest neighbors after encoding.
-    """
-
-    n = a_dist.size(0)
-    a = a_dist.clone()
-    b = b_dist.clone()
-    eye = torch.eye(n, dtype=torch.bool, device=a.device)
-    a[eye] = float("inf")
-    b[eye] = float("inf")
-    if invalid_mask is not None:
-        a[invalid_mask] = float("inf")
-        b[invalid_mask] = float("inf")
-    a_idx = torch.topk(a, k=k, largest=False).indices
-    b_idx = torch.topk(b, k=k, largest=False).indices
-
-    overlaps = []
-    for i in range(n):
-        overlaps.append(len(set(a_idx[i].tolist()) & set(b_idx[i].tolist())) / float(k))
-    return float(sum(overlaps) / len(overlaps))
-
-
 def analyze_embedding(z: torch.Tensor) -> Dict[str, float]:
-    """Measure distribution health and anti-collapse behavior of the latent space."""
     flat = z.reshape(-1, z.size(-1)).cpu()
     norms = flat.norm(dim=-1)
     cos = F.normalize(flat, dim=-1) @ F.normalize(flat, dim=-1).T
@@ -540,89 +587,62 @@ def analyze_embedding(z: torch.Tensor) -> Dict[str, float]:
     }
 
 
-def analyze_topology(
-    z: torch.Tensor,
-    state: torch.Tensor,
+def _predict_last_step(
+    model,
     *,
-    k: int,
-    max_points: int,
-    seed: int,
-) -> Dict[str, float]:
-    """Measure whether latent geometry preserves state-space geometry.
+    ctx_emb: torch.Tensor,
+    ctx_act_emb: torch.Tensor,
+    analysis_space: str,
+) -> torch.Tensor:
+    if hasattr(model, "predict_raw"):
+        pred_raw = model.predict_raw(ctx_emb, ctx_act_emb)[:, -1]
+    else:
+        pred_raw = model.predict(ctx_emb, ctx_act_emb)[:, -1]
+    if analysis_space == "raw":
+        return pred_raw
+    if hasattr(model, "normalize_embeddings"):
+        return model.normalize_embeddings(pred_raw)
+    return F.normalize(pred_raw, dim=-1, eps=1e-8)
 
-    Two additions here deserve special attention:
 
-    - `distance_rank_corr`:
-      a Spearman-style version of distance correlation that is robust to
-      monotonic rescaling. This is important when one method constrains latent
-      norms and another does not.
+@torch.no_grad()
+def collect_prediction_windows(
+    model,
+    outputs: Dict[str, torch.Tensor],
+    *,
+    history_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    spaces = get_model_spaces(model)
+    context = get_embedding_space(outputs, spaces["training_context_space"])
+    target = get_embedding_space(outputs, spaces["analysis_prediction_space"])
+    act_emb = outputs["act_emb"]
+    total_steps = context.size(1)
 
-    - `*_cross_seq` metrics:
-      these exclude pairs from the same sampled sequence window. Within-sequence
-      temporal neighbors are often trivially close and can make a broken
-      representation look better than it is. Cross-sequence metrics are stricter
-      and are usually more informative for planning-style geometry.
-    """
-
-    flat_z, flat_s, seq_ids = sample_flat_points(z, state, max_points=max_points, seed=seed)
-    n = flat_z.shape[0]
-
-    # Standardize state coordinates so one physical dimension does not dominate
-    # the distance metric purely due to units or scale.
-    flat_s = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
-    z_dist = torch.cdist(flat_z, flat_z)
-    s_dist = torch.cdist(flat_s, flat_s)
-
-    offdiag = ~torch.eye(n, dtype=torch.bool)
-    cross_seq = offdiag & (seq_ids[:, None] != seq_ids[None, :])
-
-    # Keep the original normalized sections for backward compatibility, then
-    # add explicit raw-space counterparts so hybrid models can reveal whether
-    # the planning bottleneck lives in normalization or in the raw code itself.
-    result = {
-        "n_points": int(n),
-        "k": int(k),
-        "distance_corr": pearson_corr(z_dist[offdiag], s_dist[offdiag]),
-        "distance_rank_corr": spearman_corr(z_dist[offdiag], s_dist[offdiag]),
-        "knn_overlap": knn_overlap(z_dist, s_dist, k=min(k, n - 1)),
-    }
-
-    if bool(cross_seq.any()):
-        invalid_same_seq = ~cross_seq & ~torch.eye(n, dtype=torch.bool)
-        result["distance_corr_cross_seq"] = pearson_corr(z_dist[cross_seq], s_dist[cross_seq])
-        result["distance_rank_corr_cross_seq"] = spearman_corr(z_dist[cross_seq], s_dist[cross_seq])
-        result["knn_overlap_cross_seq"] = knn_overlap(
-            z_dist,
-            s_dist,
-            k=min(k, n - 1),
-            invalid_mask=invalid_same_seq,
+    preds: List[torch.Tensor] = []
+    tgts: List[torch.Tensor] = []
+    for end_idx in range(history_size, total_steps):
+        pred = _predict_last_step(
+            model,
+            ctx_emb=context[:, end_idx - history_size : end_idx],
+            ctx_act_emb=act_emb[:, end_idx - history_size : end_idx],
+            analysis_space=spaces["analysis_prediction_space"],
         )
+        preds.append(pred)
+        tgts.append(target[:, end_idx])
 
-    return result
+    return torch.stack(preds, dim=1), torch.stack(tgts, dim=1)
 
 
-def analyze_dynamics(z: torch.Tensor, state: torch.Tensor, pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
-    """Measure whether one-step latent dynamics track real state transitions."""
-    z_now = z[:, :-1]
-    z_next = z[:, 1:]
-    s_now = state[:, :-1]
-    s_next = state[:, 1:]
-
-    latent_step = (z_next - z_now).norm(dim=-1).reshape(-1).cpu()
-    state_step = (s_next - s_now).norm(dim=-1).reshape(-1).cpu()
+def analyze_prediction(pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
     pred_err = (pred - tgt).norm(dim=-1).reshape(-1).cpu()
-
     pred_flat = pred.reshape(-1, pred.size(-1))
     tgt_flat = tgt.reshape(-1, tgt.size(-1))
     pred_cos = F.cosine_similarity(pred_flat, tgt_flat, dim=-1).cpu()
     pred_cos_dist = (1.0 - pred_cos).cpu()
 
     return {
-        "latent_step_mean": float(latent_step.mean()),
-        "latent_step_std": float(latent_step.std()),
-        "state_step_mean": float(state_step.mean()),
-        "state_step_std": float(state_step.std()),
-        "latent_state_step_corr": pearson_corr(latent_step, state_step),
+        "n_prediction_windows": int(pred.size(0) * pred.size(1)),
+        "prediction_horizon": int(pred.size(1)),
         "pred_error_mean": float(pred_err.mean()),
         "pred_error_std": float(pred_err.std()),
         "pred_target_cosine_mean": float(pred_cos.mean()),
@@ -632,20 +652,142 @@ def analyze_dynamics(z: torch.Tensor, state: torch.Tensor, pred: torch.Tensor, t
 
 
 @torch.no_grad()
+def collect_autoregressive_rollout(
+    model,
+    outputs: Dict[str, torch.Tensor],
+    *,
+    history_size: int,
+    future_steps: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    spaces = get_model_spaces(model)
+    pixels = outputs["pixels"][:, :history_size].unsqueeze(1)
+    action_sequence = outputs["action"][:, : history_size + future_steps - 1].unsqueeze(1)
+    rollout_info = model.rollout({"pixels": pixels}, action_sequence, history_size=history_size)
+
+    if spaces["analysis_prediction_space"] == "raw" and "predicted_emb_raw" in rollout_info:
+        predicted = rollout_info["predicted_emb_raw"][:, 0, history_size : history_size + future_steps]
+    else:
+        predicted = rollout_info["predicted_emb"][:, 0, history_size : history_size + future_steps]
+
+    target = get_embedding_space(outputs, spaces["analysis_prediction_space"])[:, history_size : history_size + future_steps]
+    return predicted, target
+
+
+def analyze_rollout(pred: torch.Tensor, tgt: torch.Tensor) -> Dict[str, float]:
+    step_err = (pred - tgt).norm(dim=-1).cpu()
+    step_cos = 1.0 - F.cosine_similarity(pred, tgt, dim=-1).cpu()
+
+    first_error = step_err[:, 0].mean().clamp_min(1e-8)
+    last_error = step_err[:, -1].mean()
+
+    return {
+        "rollout_horizon": int(pred.size(1)),
+        "rollout_error_mean": float(step_err.mean()),
+        "rollout_error_std": float(step_err.std()),
+        "rollout_error_last_mean": float(last_error),
+        "rollout_cosine_distance_mean": float(step_cos.mean()),
+        "rollout_cosine_distance_last_mean": float(step_cos[:, -1].mean()),
+        "rollout_error_growth": float(last_error / first_error),
+    }
+
+
+def sample_random_future_actions(
+    future_action: torch.Tensor,
+    *,
+    n_trials: int,
+    seed: int,
+) -> torch.Tensor:
+    b, horizon, act_dim = future_action.shape
+    pool = future_action.reshape(-1, act_dim).cpu()
+    if pool.size(0) == 0:
+        raise ValueError("Need at least one future action to sample random candidates.")
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randint(0, pool.size(0), (b, n_trials, horizon), generator=g)
+    sampled = pool[idx]
+    return sampled.to(future_action.device)
+
+
+@torch.no_grad()
+def analyze_planning_signal(
+    model,
+    outputs: Dict[str, torch.Tensor],
+    *,
+    history_size: int,
+    future_steps: int,
+    random_action_trials: int,
+    seed: int,
+) -> Dict[str, float]:
+    if future_steps < 2:
+        raise ValueError("planning signal probe requires future_steps >= 2.")
+
+    pixels = outputs["pixels"]
+    action = outputs["action"]
+    b = pixels.size(0)
+
+    context_pixels = pixels[:, :history_size].unsqueeze(1)
+    context_action = action[:, :history_size].unsqueeze(1)
+    goal = pixels[:, -1:].unsqueeze(1)
+
+    future_action_steps = future_steps - 1
+    expert_future = action[:, history_size : history_size + future_action_steps]
+    expert_candidate = action[:, : history_size + future_action_steps].unsqueeze(1)
+
+    random_future = sample_random_future_actions(
+        expert_future,
+        n_trials=random_action_trials,
+        seed=seed,
+    )
+    history = action[:, :history_size].unsqueeze(1).expand(b, random_action_trials, history_size, -1)
+    random_candidates = torch.cat([history, random_future], dim=2)
+    action_candidates = torch.cat([expert_candidate, random_candidates], dim=1)
+
+    info_dict = {
+        "pixels": context_pixels,
+        "action": context_action,
+        "goal": goal,
+    }
+    costs = model.get_cost(info_dict, action_candidates).detach().cpu()
+    expert_cost = costs[:, 0]
+    random_cost = costs[:, 1:]
+    best_random = random_cost.min(dim=1).values
+    margin = random_cost.mean(dim=1) - expert_cost
+
+    return {
+        "planning_horizon": int(future_steps),
+        "random_action_trials": int(random_action_trials),
+        "expert_cost_mean": float(expert_cost.mean()),
+        "expert_cost_std": float(expert_cost.std()),
+        "random_cost_mean": float(random_cost.mean()),
+        "random_cost_std": float(random_cost.std()),
+        "best_random_cost_mean": float(best_random.mean()),
+        "cost_margin_mean": float(margin.mean()),
+        "cost_margin_std": float(margin.std()),
+        "expert_beats_random_rate": float((expert_cost[:, None] < random_cost).float().mean()),
+        "expert_beats_best_random_rate": float((expert_cost < best_random).float().mean()),
+    }
+
+
+@torch.no_grad()
 def analyze_action_effect(
     model,
-    z: torch.Tensor,
-    action: torch.Tensor,
+    outputs: Dict[str, torch.Tensor],
     *,
     n_trials: int,
     interp_steps: int,
     perturb_scale: float,
 ) -> Dict[str, float]:
-    """Measure whether action changes produce structured latent branching."""
     ctx_len = infer_history_size(model)
-    ctx_emb = z[:, :ctx_len]
+    spaces = get_model_spaces(model)
+    rollout_space = spaces["inference_rollout_state_space"]
+    ctx_emb = get_embedding_space(outputs, rollout_space)[:, :ctx_len]
+    action = outputs["action"]
     base_action = action[:, :ctx_len].clone()
-    base_pred = model.predict(ctx_emb, model.action_encoder(base_action))[:, -1]
+    base_pred = _predict_last_step(
+        model,
+        ctx_emb=ctx_emb,
+        ctx_act_emb=model.action_encoder(base_action),
+        analysis_space=rollout_space,
+    )
 
     action_std = action.reshape(-1, action.size(-1)).std(dim=0).clamp_min(1e-6)
 
@@ -655,7 +797,12 @@ def analyze_action_effect(
         delta = torch.randn_like(base_action[:, -1]) * action_std * perturb_scale
         perturbed = base_action.clone()
         perturbed[:, -1] = perturbed[:, -1] + delta
-        pred = model.predict(ctx_emb, model.action_encoder(perturbed))[:, -1]
+        pred = _predict_last_step(
+            model,
+            ctx_emb=ctx_emb,
+            ctx_act_emb=model.action_encoder(perturbed),
+            analysis_space=rollout_space,
+        )
 
         perturb_norms.append(delta.norm(dim=-1))
         pred_shift_norms.append((pred - base_pred).norm(dim=-1))
@@ -678,7 +825,12 @@ def analyze_action_effect(
         single_ctx = ctx_emb[idx : idx + 1]
         for alpha in alphas:
             act = (1 - alpha) * action_a + alpha * action_b
-            pred = model.predict(single_ctx, model.action_encoder(act))[:, -1]
+            pred = _predict_last_step(
+                model,
+                ctx_emb=single_ctx,
+                ctx_act_emb=model.action_encoder(act),
+                analysis_space=rollout_space,
+            )
             interp_preds.append(pred.squeeze(0))
 
         interp_preds = torch.stack(interp_preds)
@@ -704,46 +856,102 @@ def analyze_action_effect(
     }
 
 
+def knn_overlap(
+    a_dist: torch.Tensor,
+    b_dist: torch.Tensor,
+    k: int,
+    *,
+    invalid_mask: torch.Tensor | None = None,
+) -> float:
+    n = a_dist.size(0)
+    a = a_dist.clone()
+    b = b_dist.clone()
+    eye = torch.eye(n, dtype=torch.bool, device=a.device)
+    a[eye] = float("inf")
+    b[eye] = float("inf")
+    if invalid_mask is not None:
+        a[invalid_mask] = float("inf")
+        b[invalid_mask] = float("inf")
+    a_idx = torch.topk(a, k=k, largest=False).indices
+    b_idx = torch.topk(b, k=k, largest=False).indices
+    overlaps = []
+    for i in range(n):
+        overlaps.append(len(set(a_idx[i].tolist()) & set(b_idx[i].tolist())) / float(k))
+    return float(sum(overlaps) / len(overlaps))
+
+
+def analyze_reference_probe(
+    z: torch.Tensor,
+    reference_state: torch.Tensor,
+    *,
+    reference_state_key: str,
+    k: int,
+    max_points: int,
+    seed: int,
+) -> Dict[str, float]:
+    flat_z, flat_ref, seq_ids = sample_flat_points(z, reference_state, max_points=max_points, seed=seed)
+    n = flat_z.shape[0]
+    ref_norm = (flat_ref - flat_ref.mean(0, keepdim=True)) / flat_ref.std(0, keepdim=True).clamp_min(1e-6)
+    z_dist = torch.cdist(flat_z, flat_z)
+    ref_dist = torch.cdist(ref_norm, ref_norm)
+
+    offdiag = ~torch.eye(n, dtype=torch.bool)
+    cross_seq = offdiag & (seq_ids[:, None] != seq_ids[None, :])
+    invalid_same_seq = ~cross_seq & ~torch.eye(n, dtype=torch.bool)
+
+    latent_step = (z[:, 1:] - z[:, :-1]).norm(dim=-1).reshape(-1).cpu()
+    ref_step = (reference_state[:, 1:] - reference_state[:, :-1]).norm(dim=-1).reshape(-1).cpu()
+
+    result = {
+        "reference_state_key": reference_state_key,
+        "n_points": int(n),
+        "k": int(k),
+        "latent_reference_step_corr": pearson_corr(latent_step, ref_step),
+    }
+    if bool(cross_seq.any()):
+        result["distance_rank_corr_cross_seq"] = spearman_corr(z_dist[cross_seq], ref_dist[cross_seq])
+        result["knn_overlap_cross_seq"] = knn_overlap(
+            z_dist,
+            ref_dist,
+            k=min(k, n - 1),
+            invalid_mask=invalid_same_seq,
+        )
+    return result
+
+
 def build_local_neighbor_report(
     z: torch.Tensor,
-    state: torch.Tensor,
+    reference_state: torch.Tensor,
     *,
     k: int,
     n_anchors: int,
 ) -> List[Dict[str, Any]]:
-    """Compare local neighborhoods in latent space and state space.
-
-    This file is meant for qualitative debugging after the scalar metrics point
-    to a topology problem. It lets you inspect concrete anchor states and see
-    which neighbors are preserved vs scrambled.
-    """
-
     flat_z = z.reshape(-1, z.size(-1)).cpu()
-    flat_s = state.reshape(-1, state.size(-1)).cpu()
+    flat_ref = reference_state.reshape(-1, reference_state.size(-1)).cpu()
     n = flat_z.shape[0]
-    seq_len = state.size(1)
+    seq_len = reference_state.size(1)
 
     z_dist = torch.cdist(flat_z, flat_z)
-    s_norm = (flat_s - flat_s.mean(0, keepdim=True)) / flat_s.std(0, keepdim=True).clamp_min(1e-6)
-    s_dist = torch.cdist(s_norm, s_norm)
+    ref_norm = (flat_ref - flat_ref.mean(0, keepdim=True)) / flat_ref.std(0, keepdim=True).clamp_min(1e-6)
+    ref_dist = torch.cdist(ref_norm, ref_norm)
 
     eye = torch.eye(n, dtype=torch.bool)
     z_dist[eye] = float("inf")
-    s_dist[eye] = float("inf")
+    ref_dist[eye] = float("inf")
 
     anchors = torch.linspace(0, n - 1, steps=min(n_anchors, n)).long().unique()
     report: List[Dict[str, Any]] = []
     for anchor in anchors.tolist():
         z_nn = torch.topk(z_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
-        s_nn = torch.topk(s_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
+        ref_nn = torch.topk(ref_dist[anchor], k=min(k, n - 1), largest=False).indices.tolist()
         item = {
             "anchor_index": anchor,
             "anchor_seq_id": anchor // seq_len,
             "anchor_time_id": anchor % seq_len,
-            "anchor_state": flat_s[anchor].tolist(),
-            "overlap": len(set(z_nn) & set(s_nn)) / float(min(k, n - 1)),
+            "anchor_reference_state": flat_ref[anchor].tolist(),
+            "overlap": len(set(z_nn) & set(ref_nn)) / float(min(k, n - 1)),
             "latent_nn": [],
-            "state_nn": [],
+            "reference_nn": [],
         }
         for idx in z_nn:
             item["latent_nn"].append({
@@ -751,31 +959,29 @@ def build_local_neighbor_report(
                 "seq_id": idx // seq_len,
                 "time_id": idx % seq_len,
                 "latent_distance": float(z_dist[anchor, idx]),
-                "state_distance": float(s_dist[anchor, idx]),
-                "state": flat_s[idx].tolist(),
+                "reference_distance": float(ref_dist[anchor, idx]),
+                "reference_state": flat_ref[idx].tolist(),
             })
-        for idx in s_nn:
-            item["state_nn"].append({
+        for idx in ref_nn:
+            item["reference_nn"].append({
                 "index": idx,
                 "seq_id": idx // seq_len,
                 "time_id": idx % seq_len,
                 "latent_distance": float(z_dist[anchor, idx]),
-                "state_distance": float(s_dist[anchor, idx]),
-                "state": flat_s[idx].tolist(),
+                "reference_distance": float(ref_dist[anchor, idx]),
+                "reference_state": flat_ref[idx].tolist(),
             })
         report.append(item)
     return report
 
 
 def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> List[str]:
-    """Environment-aware interpretation hints."""
     dataset_l = dataset.lower()
     emb = result["embedding"]
-    topo = result["topology"]
-    dyn = result["dynamics"]
+    pred = result["prediction"]
+    rollout = result["rollout"]
+    planning = result["planning"]
     act = result["action_effect"]
-    topo_corr = topo.get("distance_corr_cross_seq", topo["distance_corr"])
-    topo_knn = topo.get("knn_overlap_cross_seq", topo["knn_overlap"])
 
     hints: List[str] = []
 
@@ -784,41 +990,44 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     elif emb["effective_rank"] < 12:
         hints.append("Embedding rank is moderate; anti-collapse works, but capacity usage may still be limited.")
     else:
-        hints.append("Embedding rank looks healthy; remaining issues likely come from geometry or dynamics rather than collapse.")
+        hints.append("Embedding rank looks healthy; remaining issues likely come from rollout or planning signal rather than collapse.")
 
-    if topo_corr < 0.2:
-        hints.append("Latent distances do not track state distances well; geometry is a likely bottleneck.")
-    elif topo_corr < 0.5:
-        hints.append("Latent geometry partially tracks state geometry, but there is still clear distortion.")
+    if pred["pred_target_cosine_distance_mean"] > 0.05:
+        hints.append("One-step prediction is still weak; improving rollout or planning before fixing this is premature.")
     else:
-        hints.append("Latent geometry tracks state geometry reasonably well.")
+        hints.append("One-step prediction is reasonably accurate; if eval is weak, multi-step drift or cost quality is the next place to look.")
 
-    if topo_knn < 0.2:
-        hints.append("Local neighborhoods disagree strongly between latent and state spaces.")
-    elif topo_knn > 0.5:
-        hints.append("Local neighborhoods are preserved fairly well.")
+    if rollout["rollout_error_growth"] > 2.0:
+        hints.append("Autoregressive rollout error grows quickly with horizon; compounding error is a likely bottleneck.")
+    elif rollout["rollout_cosine_distance_last_mean"] < 0.05:
+        hints.append("Autoregressive rollout stays fairly consistent over the tested horizon.")
 
-    if dyn["latent_state_step_corr"] < 0.2:
-        hints.append("Latent motion is weakly aligned with true state motion; predictor/action conditioning is a good next target.")
-    elif dyn["latent_state_step_corr"] > 0.5:
-        hints.append("Latent motion is fairly well aligned with true state motion.")
+    if planning["cost_margin_mean"] <= 0.0:
+        hints.append("The model's cost does not prefer expert futures over random futures; planner guidance is likely too weak.")
+    elif planning["expert_beats_best_random_rate"] < 0.4:
+        hints.append("Expert futures beat the random mean but not the best random candidates often enough; planning signal is fragile.")
+    else:
+        hints.append("Expert futures usually rank better than random ones under the model cost; planning signal looks usable.")
 
     if act["action_perturb_pred_shift_corr"] < 0.2:
         hints.append("Action perturbations do not produce structured latent branching; action usage may be weak.")
-    elif act["action_perturb_pred_shift_corr"] > 0.5:
-        hints.append("Action perturbations produce structured latent branching.")
+    elif act["mean_pred_shift_norm"] < 0.2:
+        hints.append("Action perturbations change predictions only weakly; latent dynamics may be too insensitive even if correlated.")
 
-    if act["interpolation_monotonicity"] < 0.75:
-        hints.append("Action interpolation is not very smooth; local latent dynamics may be jagged.")
+    ref = result.get("reference_probe")
+    if isinstance(ref, Mapping) and ref:
+        rank_corr = ref.get("distance_rank_corr_cross_seq")
+        if rank_corr is not None and rank_corr < 0.1:
+            hints.append("The optional external state proxy disagrees strongly with latent geometry. Treat this as a probe, not a verdict, unless that proxy is known to be task-correct.")
 
-    if "tworoom" in dataset_l:
-        hints.append("For TwoRoom, inspect whether door-adjacent states remain connected instead of splitting into disconnected islands.")
-    elif "pusht" in dataset_l:
-        hints.append("For PushT, inspect whether agent/block position changes form a smooth sheet instead of fragmented clusters.")
+    if "pusht" in dataset_l:
+        hints.append("For PushT, prioritize cost separation and rollout drift over raw state-geometry matching unless the reference state is explicitly task-curated.")
+    elif "tworoom" in dataset_l:
+        hints.append("For TwoRoom, watch whether long-horizon rollout stays coherent across door transitions instead of drifting across disconnected regions.")
     elif "cube" in dataset_l or "ogb" in dataset_l:
-        hints.append("For Cube, inspect whether contact transitions bend the manifold smoothly instead of tearing local neighborhoods.")
+        hints.append("For Cube, check whether the planner signal separates contact-consistent futures from random action futures.")
     elif "reacher" in dataset_l or "dmc" in dataset_l:
-        hints.append("For Reacher, inspect whether continuous arm poses remain continuous in the latent projection.")
+        hints.append("For Reacher, focus on whether rollout remains smooth and goal-directed over horizon rather than matching a proxy state exactly.")
 
     return hints
 
@@ -840,7 +1049,6 @@ def metric_spec(section: str, key: str) -> Dict[str, str]:
 
 
 def metric_entries(result: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str, Any]]:
-    """Return scalar-like result entries in a stable order for table export."""
     entries: List[Tuple[str, str, Any]] = []
     for section in SECTION_ORDER:
         metrics = result.get(section)
@@ -890,90 +1098,126 @@ def run_analysis(
     *,
     ckpt: str,
     dataset: str,
-    state_key: str,
+    state_key: str | None,
     frameskip: int,
     img_size: int,
     n_sequences: int,
+    future_steps: int,
     max_points: int,
     knn_k: int,
     action_trials: int,
+    planning_random_trials: int,
     interp_steps: int,
     perturb_scale: float,
     seed: int,
     device: str,
     log: Callable[[str], None] | None = print,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, torch.Tensor]]:
-    """Run the full representation analysis and return metrics plus tensors."""
+    if future_steps < 2:
+        raise ValueError("future_steps must be >= 2 so rollout and planning probes have a meaningful future horizon.")
 
+    reference_state_key = (state_key or "").strip() or None
     if log is not None:
         log(f"[analyze_repr] loading model: {ckpt}")
     model = load_model(ckpt, device)
     history_size = infer_history_size(model)
     if log is not None:
-        log(f"[analyze_repr] dataset={dataset} state_key={state_key} history_size={history_size}")
+        log(
+            f"[analyze_repr] dataset={dataset} reference_state_key={reference_state_key} "
+            f"history_size={history_size} future_steps={future_steps}"
+        )
 
     batch = load_dataset_samples(
         dataset_name=dataset,
-        state_key=state_key,
+        state_key=reference_state_key,
         n_sequences=n_sequences,
         history_size=history_size,
+        future_steps=future_steps,
         frameskip=frameskip,
         img_size=img_size,
         seed=seed,
         device=device,
     )
     outputs = encode_sequences(model, batch)
+    spaces = get_model_spaces(model)
 
-    result = {
+    pred, tgt = collect_prediction_windows(model, outputs, history_size=history_size)
+    rollout_pred, rollout_tgt = collect_autoregressive_rollout(
+        model,
+        outputs,
+        history_size=history_size,
+        future_steps=future_steps,
+    )
+
+    result: Dict[str, Dict[str, Any]] = {
         "meta": {
             "ckpt": ckpt,
             "dataset": dataset,
-            "state_key": state_key,
+            "reference_state_key": reference_state_key,
             "n_sequences": n_sequences,
             "history_size": history_size,
+            "future_steps": future_steps,
             "device": device,
-            "analysis_prediction_space": getattr(model, "analysis_prediction_space", "normalized"),
-            "inference_rollout_state_space": getattr(model, "inference_rollout_state_space", "normalized"),
-            "inference_cost_space": getattr(model, "inference_cost_space", "normalized"),
-            "inference_cost_type": getattr(model, "inference_cost_type", "cosine"),
+            **spaces,
         },
         "embedding": analyze_embedding(outputs["emb"]),
-        "topology": analyze_topology(
-            outputs["emb"],
-            outputs["state"],
-            k=knn_k,
-            max_points=max_points,
+        "prediction": analyze_prediction(pred, tgt),
+        "rollout": analyze_rollout(rollout_pred, rollout_tgt),
+        "planning": analyze_planning_signal(
+            model,
+            outputs,
+            history_size=history_size,
+            future_steps=future_steps,
+            random_action_trials=planning_random_trials,
             seed=seed,
         ),
-        "dynamics": analyze_dynamics(outputs["emb"], outputs["state"], outputs["pred"], outputs["tgt"]),
         "action_effect": analyze_action_effect(
             model,
-            outputs["emb"],
-            outputs["action"],
+            outputs,
             n_trials=action_trials,
             interp_steps=interp_steps,
             perturb_scale=perturb_scale,
         ),
     }
+
+    if reference_state_key and "state" in outputs:
+        result["reference_probe"] = analyze_reference_probe(
+            outputs["emb"],
+            outputs["state"],
+            reference_state_key=reference_state_key,
+            k=knn_k,
+            max_points=max_points,
+            seed=seed,
+        )
+
     result["interpretation"] = make_interpretation(dataset, result)
+    outputs["prediction_pred"] = pred
+    outputs["prediction_tgt"] = tgt
+    outputs["rollout_pred"] = rollout_pred
+    outputs["rollout_tgt"] = rollout_tgt
     return result, outputs
 
 
-def save_projection_rows(proj: torch.Tensor, state: torch.Tensor, save_path: Path):
-    flat_s = state.reshape(-1, state.size(-1)).cpu()
+def save_projection_rows(
+    proj: torch.Tensor,
+    reference_state: torch.Tensor | None,
+    *,
+    seq_len: int,
+    save_path: Path,
+):
     rows = []
-    seq_len = state.size(1)
+    flat_ref = reference_state.reshape(-1, reference_state.size(-1)).cpu() if reference_state is not None else None
+
     for idx in range(proj.size(0)):
-        seq_id = idx // seq_len
-        time_id = idx % seq_len
         row = {
-            "seq_id": seq_id,
-            "time_id": time_id,
+            "seq_id": idx // seq_len,
+            "time_id": idx % seq_len,
             "x": float(proj[idx, 0]),
             "y": float(proj[idx, 1]),
         }
-        for dim in range(flat_s.size(1)):
-            row[f"state_{dim}"] = float(flat_s[idx, dim])
+        if reference_state is not None and flat_ref is not None:
+            for dim in range(flat_ref.size(1)):
+                row[f"state_{dim}"] = float(flat_ref[idx, dim])
         rows.append(row)
 
     with open(save_path, "w") as f:
@@ -981,7 +1225,6 @@ def save_projection_rows(proj: torch.Tensor, state: torch.Tensor, save_path: Pat
 
 
 def save_metric_guide(save_path: Path):
-    """Save the metric glossary so result folders remain self-explanatory."""
     with open(save_path, "w") as f:
         json.dump(to_serializable(METRIC_SPECS), f, indent=2)
 
@@ -990,7 +1233,7 @@ def save_outputs(
     save_dir: Path,
     result: Dict[str, Dict[str, Any]],
     z: torch.Tensor,
-    state: torch.Tensor,
+    reference_state: torch.Tensor | None,
     *,
     export_tsne: bool,
     tsne_perplexity: float,
@@ -1000,7 +1243,12 @@ def save_outputs(
 
     flat_z = z.reshape(-1, z.size(-1)).cpu()
     pca_proj = pca_projection(flat_z, out_dim=2)
-    save_projection_rows(pca_proj, state, save_dir / "pca_projection.json")
+    save_projection_rows(
+        pca_proj,
+        reference_state,
+        seq_len=z.size(1),
+        save_path=save_dir / "pca_projection.json",
+    )
 
     if export_tsne:
         try:
@@ -1010,7 +1258,12 @@ def save_outputs(
                 perplexity=tsne_perplexity,
                 random_state=seed,
             )
-            save_projection_rows(tsne_proj, state, save_dir / "tsne_projection.json")
+            save_projection_rows(
+                tsne_proj,
+                reference_state,
+                seq_len=z.size(1),
+                save_path=save_dir / "tsne_projection.json",
+            )
             result.setdefault("visualization", {})["tsne_exported"] = True
             result["visualization"]["tsne_perplexity"] = float(
                 min(tsne_perplexity, max(1.0, float((flat_z.size(0) - 1) // 3)))
@@ -1019,8 +1272,9 @@ def save_outputs(
             result.setdefault("visualization", {})["tsne_exported"] = False
             result["visualization"]["tsne_error"] = str(exc)
 
-    with open(save_dir / "local_neighbors.json", "w") as f:
-        json.dump(build_local_neighbor_report(z, state, k=8, n_anchors=12), f, indent=2)
+    if reference_state is not None:
+        with open(save_dir / "local_neighbors.json", "w") as f:
+            json.dump(build_local_neighbor_report(z, reference_state, k=8, n_anchors=12), f, indent=2)
 
     with open(save_dir / "summary.json", "w") as f:
         json.dump(to_serializable(result), f, indent=2)
@@ -1030,14 +1284,21 @@ def save_outputs(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Object checkpoint path")
-    parser.add_argument("--dataset", type=str, required=True, help="Dataset name, e.g. tworoom")
-    parser.add_argument("--state-key", type=str, default="proprio", help="State proxy key in dataset")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name/path")
+    parser.add_argument(
+        "--state-key",
+        type=str,
+        default=None,
+        help="Optional external state key used only for the reference probe, e.g. proprio",
+    )
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--n-sequences", type=int, default=128)
+    parser.add_argument("--future-steps", type=int, default=8, help="Future steps used for rollout and planning-signal probes")
     parser.add_argument("--max-points", type=int, default=512)
     parser.add_argument("--knn-k", type=int, default=10)
     parser.add_argument("--action-trials", type=int, default=8)
+    parser.add_argument("--planning-random-trials", type=int, default=16)
     parser.add_argument("--interp-steps", type=int, default=9)
     parser.add_argument("--perturb-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=3072)
@@ -1051,7 +1312,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     parser = build_parser()
     args = parser.parse_args()
-
     result, outputs = run_analysis(
         ckpt=args.ckpt,
         dataset=args.dataset,
@@ -1059,9 +1319,11 @@ def main():
         frameskip=args.frameskip,
         img_size=args.img_size,
         n_sequences=args.n_sequences,
+        future_steps=args.future_steps,
         max_points=args.max_points,
         knn_k=args.knn_k,
         action_trials=args.action_trials,
+        planning_random_trials=args.planning_random_trials,
         interp_steps=args.interp_steps,
         perturb_scale=args.perturb_scale,
         seed=args.seed,
@@ -1072,7 +1334,7 @@ def main():
     if args.export_tsne:
         print(
             "\n[analyze_repr] t-SNE requested: this is for local-neighborhood visualisation only; "
-            "do not use it as a quantitative judge of global latent geometry."
+            "do not use it as a quantitative judge of planning signal or global latent quality."
         )
 
     if args.save_dir:
@@ -1081,7 +1343,7 @@ def main():
             save_dir,
             result,
             outputs["emb"],
-            outputs["state"],
+            outputs.get("state"),
             export_tsne=args.export_tsne,
             tsne_perplexity=args.tsne_perplexity,
             seed=args.seed,

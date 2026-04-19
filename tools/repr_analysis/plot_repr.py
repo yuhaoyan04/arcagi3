@@ -29,6 +29,18 @@ def load_rows(path: Path) -> List[Dict[str, float]]:
         return json.load(f)
 
 
+def resolve_color_key(rows: List[Dict[str, float]], dim: int) -> str:
+    preferred = f"state_{dim}"
+    if preferred in rows[0]:
+        return preferred
+    fallback = "time_id" if dim == 0 else "seq_id" if dim == 1 else None
+    if fallback and fallback in rows[0]:
+        return fallback
+    raise KeyError(
+        f"{preferred} not found in projection file, and no fallback color key is available."
+    )
+
+
 def save_projection_plot(
     rows: List[Dict[str, float]],
     *,
@@ -56,9 +68,7 @@ def save_projection_plot(
     axes = axes[0]
 
     for ax, dim in zip(axes, color_dims):
-        key = f"state_{dim}"
-        if key not in rows[0]:
-            raise KeyError(f"{key} not found in projection file.")
+        key = resolve_color_key(rows, dim)
         c = [row[key] for row in rows]
         sc = ax.scatter(x, y, c=c, s=size, alpha=alpha, cmap="viridis")
         ax.set_xlabel("x")

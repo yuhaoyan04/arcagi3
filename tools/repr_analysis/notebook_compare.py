@@ -47,28 +47,8 @@ DEFAULT_KEY_METRICS: List[Dict[str, str]] = [
         "diagnosis": "Large magnitude means samples crowd into similar directions instead of spreading cleanly.",
     },
     {
-        "group": "Topology",
-        "metric_name": "topology.distance_rank_corr_cross_seq",
-        "label": "distance_rank_corr_cross_seq",
-        "short_label": "rank_corr_xseq",
-        "better": "higher",
-        "brief": "global cross-trajectory geometry",
-        "summary": "Whether cross-trajectory distance ordering is preserved.",
-        "diagnosis": "Low means the global planning geometry is distorted across trajectories.",
-    },
-    {
-        "group": "Topology",
-        "metric_name": "topology.knn_overlap_cross_seq",
-        "label": "knn_overlap_cross_seq",
-        "short_label": "knn_xseq",
-        "better": "higher",
-        "brief": "local cross-trajectory neighborhoods",
-        "summary": "Whether cross-trajectory local neighbors stay neighbors in latent space.",
-        "diagnosis": "Low means local neighborhoods are scrambled even when states should be close.",
-    },
-    {
-        "group": "Dynamics",
-        "metric_name": "dynamics.pred_target_cosine_distance_mean",
+        "group": "Prediction",
+        "metric_name": "prediction.pred_target_cosine_distance_mean",
         "label": "pred_target_cosine_distance_mean",
         "short_label": "pred_cos_dist",
         "better": "lower",
@@ -77,14 +57,34 @@ DEFAULT_KEY_METRICS: List[Dict[str, str]] = [
         "diagnosis": "High means the predictor is missing the next latent target.",
     },
     {
-        "group": "Dynamics",
-        "metric_name": "dynamics.latent_state_step_corr",
-        "label": "latent_state_step_corr",
-        "short_label": "step_corr",
+        "group": "Rollout",
+        "metric_name": "rollout.rollout_cosine_distance_last_mean",
+        "label": "rollout_cosine_distance_last_mean",
+        "short_label": "rollout_last",
+        "better": "lower",
+        "brief": "multi-step drift at horizon end",
+        "summary": "Autoregressive rollout error at the last tested horizon step.",
+        "diagnosis": "High means rollout drifts even if one-step prediction looks good.",
+    },
+    {
+        "group": "Planning",
+        "metric_name": "planning.cost_margin_mean",
+        "label": "cost_margin_mean",
+        "short_label": "cost_margin",
         "better": "higher",
-        "brief": "latent/state motion alignment",
-        "summary": "Whether larger state moves also produce larger latent moves.",
-        "diagnosis": "Low means latent motion is poorly calibrated to environment motion.",
+        "brief": "expert vs random cost gap",
+        "summary": "Random-minus-expert cost gap under the model's own planner objective.",
+        "diagnosis": "Low or negative means the planner cost cannot separate good futures from random ones.",
+    },
+    {
+        "group": "Planning",
+        "metric_name": "planning.expert_beats_random_rate",
+        "label": "expert_beats_random_rate",
+        "short_label": "expert>random",
+        "better": "higher",
+        "brief": "planner preference rate",
+        "summary": "Fraction of random candidates whose cost is worse than the expert future.",
+        "diagnosis": "Low means the planner cannot reliably rank expert futures above random ones.",
     },
     {
         "group": "Action Effect",
@@ -664,9 +664,8 @@ def plot_metric_heatmap(
     return fig
 
 
-def _projection_rows_from_tensor(proj, state) -> List[Dict[str, float]]:
-    flat_state = state.reshape(-1, state.size(-1)).cpu()
-    seq_len = state.size(1)
+def _projection_rows_from_tensor(proj, state, *, seq_len: int) -> List[Dict[str, float]]:
+    flat_state = state.reshape(-1, state.size(-1)).cpu() if state is not None else None
     rows: List[Dict[str, float]] = []
     for idx in range(proj.size(0)):
         row: Dict[str, float] = {
@@ -675,8 +674,9 @@ def _projection_rows_from_tensor(proj, state) -> List[Dict[str, float]]:
             "x": float(proj[idx, 0]),
             "y": float(proj[idx, 1]),
         }
-        for dim in range(flat_state.size(1)):
-            row[f"state_{dim}"] = float(flat_state[idx, dim])
+        if flat_state is not None:
+            for dim in range(flat_state.size(1)):
+                row[f"state_{dim}"] = float(flat_state[idx, dim])
         rows.append(row)
     return rows
 
@@ -701,7 +701,11 @@ def _projection_rows_from_outputs(
         )
     else:
         raise ValueError(f"Unknown projection type: {projection}")
-    return _projection_rows_from_tensor(proj, outputs["state"])
+    return _projection_rows_from_tensor(
+        proj,
+        outputs.get("state"),
+        seq_len=outputs["emb"].size(1),
+    )
 
 
 def _load_projection_rows(path: Path) -> List[Dict[str, float]]:
@@ -796,12 +800,19 @@ def _plot_projection_rows_grid(
     )
 
     for col_idx, dim in enumerate(color_dims):
-        key = f"state_{dim}"
-        values = [row[key] for label in model_labels for row in rows_by_label[label]]
+        key_by_label = {
+            label: _resolve_projection_color_key(rows_by_label[label], dim) for label in model_labels
+        }
+        values = [
+            row[key_by_label[label]]
+            for label in model_labels
+            for row in rows_by_label[label]
+        ]
         vmin, vmax = min(values), max(values)
 
         for row_idx, label in enumerate(model_labels):
             rows = rows_by_label[label]
+            key = key_by_label[label]
             ax = axes[row_idx][col_idx]
             sc = ax.scatter(
                 [row["x"] for row in rows],
@@ -824,6 +835,18 @@ def _plot_projection_rows_grid(
         output.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output, dpi=200, bbox_inches="tight")
     return fig
+
+
+def _resolve_projection_color_key(rows: List[Mapping[str, float]], dim: int) -> str:
+    preferred = f"state_{dim}"
+    if preferred in rows[0]:
+        return preferred
+    fallback = "time_id" if dim == 0 else "seq_id" if dim == 1 else None
+    if fallback and fallback in rows[0]:
+        return fallback
+    raise KeyError(
+        f"{preferred} not found in projection rows, and no fallback color key is available."
+    )
 
 
 def run_model_analysis(
@@ -873,7 +896,7 @@ def run_model_analysis(
             analysis_dir,
             result,
             outputs["emb"],
-            outputs["state"],
+            outputs.get("state"),
             export_tsne=export_tsne,
             tsne_perplexity=tsne_perplexity,
             seed=seed,

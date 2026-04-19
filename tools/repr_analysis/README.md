@@ -5,10 +5,12 @@ LeWM / SWM experiments.
 
 The goal is not just to ask "did the model avoid collapse?", but to answer:
 
-- Is the latent space geometrically meaningful?
-- Does it preserve local state-space structure?
+- Does the latent space stay expressive without collapsing?
+- Can it predict the next latent accurately?
+- Does autoregressive rollout drift quickly under real dataset actions?
+- Does the model's own planning cost prefer expert futures over random futures?
 - Does action actually produce meaningful latent branching?
-- Is a new loss better than SIGReg, or merely different?
+- If we choose an external state proxy, does latent geometry roughly agree with it?
 
 ## Files
 
@@ -71,55 +73,61 @@ Basic usage:
 python tools/repr_analysis/analyze_repr.py \
   --ckpt /path/to/model_object.pt \
   --dataset tworoom \
-  --state-key proprio \
+  --future-steps 8 \
   --save-dir /tmp/repr_analysis_tworoom
 ```
 
-With t-SNE export:
+With an optional external reference probe:
 
 ```bash
 python tools/repr_analysis/analyze_repr.py \
   --ckpt /path/to/model_object.pt \
   --dataset pusht \
   --state-key proprio \
-  --save-dir /tmp/repr_analysis_pusht \
-  --export-tsne
+  --future-steps 8 \
+  --save-dir /tmp/repr_analysis_pusht
 ```
 
 Useful flags:
 
 - `--ckpt`: object checkpoint path
 - `--dataset`: dataset name, e.g. `tworoom`, `pusht`, `ogb`, `dmc`
-- `--state-key`: default is `proprio`
+- `--state-key`: optional external state key used only for the `reference_probe`
 - `--n-sequences`: number of sampled sequences, default `128`
-- `--max-points`: cap for topology analysis, default `512`
+- `--future-steps`: future states used for rollout and planning-signal probes, default `8`
+- `--max-points`: cap for the optional reference-probe subsample, default `512`
 - `--knn-k`: k for neighborhood overlap, default `10`
+- `--planning-random-trials`: number of random futures compared against expert futures, default `16`
 - `--export-tsne`: export `tsne_projection.json` if `scikit-learn` is installed
 - `--tsne-perplexity`: default `30`
 - `--save-dir`: output directory for JSON exports
 
 Notes on rigor:
-- topology metrics now use a random flat-point subsample instead of taking the first `N` flattened points
-- topology also reports `*_cross_seq` metrics to reduce inflation from trivial within-sequence temporal neighbors
+- prediction metrics are evaluated over sliding teacher-forced windows across the sampled sequences
+- rollout metrics use real dataset action futures and the model's actual autoregressive rollout branch
+- planning metrics use the model's own `get_cost()` and compare expert futures against random futures for the same start-goal pair
+- the old state-geometry comparison is now an optional `reference_probe`, not the main verdict
 - action-effect correlation is computed over all perturbed samples, not just one mean per trial
 - interpolation smoothness is averaged over multiple anchors instead of a single context
 
 ## 2. Outputs
 
-`analyze_repr.py` prints four analysis blocks:
+`analyze_repr.py` now prints:
 
 - `Embedding`
   - anti-collapse / distribution health
   - norms, per-dim std, inter-sample cosine, effective rank
-- `Topology`
-  - latent distance vs state distance
-  - kNN overlap between latent space and state space
-- `Dynamics`
-  - whether latent motion tracks state motion
-  - prediction error and pred-target cosine
+- `Prediction`
+  - one-step latent prediction quality over sliding windows
+- `Rollout`
+  - autoregressive multi-step drift under real dataset actions
+- `Planning`
+  - expert-vs-random cost separation using the model's own planner objective
 - `Action Effect`
   - whether changing actions creates meaningful latent branching
   - whether action interpolation is smooth
+- `Reference Probe` (only if `--state-key` is provided)
+  - optional comparison against an external dataset state proxy
 
 It also prints an `Interpretation` section with environment-aware diagnostic hints.
 
@@ -136,7 +144,8 @@ When `--save-dir` is provided:
 - `tsne_projection.json`
   2D t-SNE projection, only if exported successfully.
 - `local_neighbors.json`
-  Anchor-by-anchor comparison of nearest neighbors in latent vs state space.
+  Anchor-by-anchor comparison of nearest neighbors in latent vs reference-proxy space.
+  This file is only written when `--state-key` is provided.
 
 ## 3. Batch Analyze Multiple Runs
 
@@ -148,7 +157,7 @@ Example:
 ```bash
 python -m tools.repr_analysis.batch_repr_analysis \
   --dataset /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/pusht_expert_train \
-  --state-key proprio \
+  --future-steps 8 \
   --save-dir /opt/huawei/explorer-env/dataset/ag_data/data/world_model/quentinll/lewm-pusht/repr_analysis/pusht_batch_compare \
   --plot-projections pca \
   --compare-projections pca \
@@ -307,52 +316,78 @@ Bad signs:
 - cosine similarity stays very high
 - one or a few dimensions dominate
 
-### Topology
+### Prediction
 
 Most important metrics:
-- `distance_corr`
-- `distance_rank_corr`
-- `knn_overlap`
-- `distance_corr_cross_seq`
+- `pred_target_cosine_distance_mean`
+- `pred_error_mean`
+
+Good signs:
+- one-step prediction error is low
+- cosine distance is low and stable across windows
+
+Bad signs:
+- even teacher-forced one-step prediction is weak
+- before worrying about planning, the predictor itself is still inaccurate
+
+Notes:
+- prediction metrics are measured over sliding teacher-forced windows across the sampled sequence
+- the comparison space follows the model's configured prediction-analysis space automatically
+
+### Rollout
+
+Most important metrics:
+- `rollout_cosine_distance_last_mean`
+- `rollout_error_growth`
+
+Good signs:
+- rollout stays close to the encoded future under real dataset actions
+- last-step error is not dramatically worse than first-step error
+
+Bad signs:
+- one-step prediction looks fine but multi-step rollout drifts quickly
+- `rollout_error_growth` is large, which usually means compounding error is the real bottleneck
+
+Notes:
+- rollout metrics use the model's actual autoregressive inference branch, not a simplified teacher-forced surrogate
+- this section is often more diagnostic for planning than any external geometry probe
+
+### Planning
+
+Most important metrics:
+- `cost_margin_mean`
+- `expert_beats_random_rate`
+- `expert_beats_best_random_rate`
+
+Good signs:
+- expert futures get lower cost than random futures for the same start and goal
+- the cost gap is positive and stable across sequences
+
+Bad signs:
+- random futures score as well as or better than expert futures
+- planner cost has weak or inconsistent separation even when prediction looks okay
+
+Notes:
+- planning metrics call the model's own `get_cost()` with the current inference rollout/cost spaces
+- they probe whether the cost function itself carries useful control signal, which is usually more important than matching an external state geometry
+
+### Reference Probe
+
+Most important metrics:
 - `distance_rank_corr_cross_seq`
 - `knn_overlap_cross_seq`
+- `latent_reference_step_corr`
 
 Good signs:
-- nearby states remain nearby in latent space
-- local neighborhoods are preserved
-- cross-sequence metrics stay close to all-pairs metrics, which suggests the result is not mainly coming from trivial temporal adjacency
+- only if the chosen `state_key` is known to be task-meaningful, decent agreement can be reassuring
 
 Bad signs:
-- local geometry is scrambled even though spread loss looks good
-- the manifold is fragmented into visually distinct islands
+- low agreement does **not** automatically mean the world model is bad
+- it may only mean the external proxy state is not the right geometry to match
 
 Notes:
-- `distance_corr` is Pearson correlation on pairwise distances
-- `distance_rank_corr` is the `_rank` metric: a Spearman-style rank correlation on pairwise distances
-- use `_rank` when you care about whether the latent preserves the ordering of distances, even if one method rescales or normalizes the geometry
-- `*_cross_seq` excludes comparisons inside the same sampled sequence window; these are often the more trustworthy metrics when judging planning geometry
-- use `_cross_seq` as the stricter number when adjacent frames inside one rollout are trivially easy and may inflate the all-pairs metric
-
-### Dynamics
-
-Most important metrics:
-- `latent_state_step_corr`
-- `pred_error_mean`
-- `pred_target_cosine_mean`
-- `pred_target_cosine_distance_mean`
-
-Good signs:
-- latent motion magnitude tracks true state motion
-- one-step prediction error is low
-- cosine similarity is high / cosine distance is low
-
-Bad signs:
-- latent geometry looks nice, but dynamics are not action- or state-consistent
-
-Notes:
-- `pred_target_cosine_mean` is now the **true cosine similarity**, not an unnormalised dot product.
-- This makes it much more appropriate for comparing SWM-like cosine-trained models against LeWM/SIGReg models.
-- `pred_error_mean` is still useful, but it is scale-dependent and should not be the only cross-method comparison metric.
+- this section is optional and only appears when `--state-key` is provided
+- treat it as a probe, not as the final judge of planning usefulness
 
 ### Action Effect
 
@@ -386,9 +421,9 @@ This is important.
 - deciding that one method is better from visualization alone
 
 Use it together with:
-- `distance_corr`
-- `knn_overlap`
-- `latent_state_step_corr`
+- `rollout_cosine_distance_last_mean`
+- `cost_margin_mean`
+- `expert_beats_random_rate`
 
 ## 8. Environment-Specific Focus
 

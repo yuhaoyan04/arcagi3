@@ -213,13 +213,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", action="append", required=True, help="Repeatable `label=ckpt_path` entry.")
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name/path, e.g. pusht_expert_train")
-    parser.add_argument("--state-key", type=str, default="proprio")
+    parser.add_argument(
+        "--state-key",
+        type=str,
+        default=None,
+        help="Optional external state key used only for the reference probe.",
+    )
     parser.add_argument("--frameskip", type=int, default=5)
     parser.add_argument("--img-size", type=int, default=224)
     parser.add_argument("--n-sequences", type=int, default=128)
+    parser.add_argument("--future-steps", type=int, default=8)
     parser.add_argument("--max-points", type=int, default=512)
     parser.add_argument("--knn-k", type=int, default=10)
     parser.add_argument("--action-trials", type=int, default=8)
+    parser.add_argument("--planning-random-trials", type=int, default=16)
     parser.add_argument("--interp-steps", type=int, default=9)
     parser.add_argument("--perturb-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=3072)
@@ -386,9 +393,11 @@ def main():
             frameskip=args.frameskip,
             img_size=args.img_size,
             n_sequences=args.n_sequences,
+            future_steps=args.future_steps,
             max_points=args.max_points,
             knn_k=args.knn_k,
             action_trials=args.action_trials,
+            planning_random_trials=args.planning_random_trials,
             interp_steps=args.interp_steps,
             perturb_scale=args.perturb_scale,
             seed=args.seed,
@@ -400,7 +409,7 @@ def main():
             model_dir,
             result,
             outputs["emb"],
-            outputs["state"],
+            outputs.get("state"),
             export_tsne=args.export_tsne,
             tsne_perplexity=args.tsne_perplexity,
             seed=args.seed,

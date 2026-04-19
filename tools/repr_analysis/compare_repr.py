@@ -46,29 +46,42 @@ def load_summary(analysis_dir: Path) -> Dict:
         return json.load(f)
 
 
+def resolve_color_key(rows: List[Dict[str, float]], dim: int) -> str:
+    preferred = f"state_{dim}"
+    if preferred in rows[0]:
+        return preferred
+    fallback = "time_id" if dim == 0 else "seq_id" if dim == 1 else None
+    if fallback and fallback in rows[0]:
+        return fallback
+    raise KeyError(
+        f"{preferred} not found in projection file, and no fallback color key is available."
+    )
+
+
 def make_caption(summary: dict) -> str:
     if not summary:
         return ""
     parts = []
     meta = summary.get("meta", {})
     emb = summary.get("embedding", {})
-    topo = summary.get("topology", {})
-    dyn = summary.get("dynamics", {})
+    pred = summary.get("prediction", {})
+    rollout = summary.get("rollout", {})
+    planning = summary.get("planning", {})
+    ref = summary.get("reference_probe", {})
     if meta.get("dataset"):
         parts.append(f"dataset={meta['dataset']}")
     if "effective_rank" in emb:
         parts.append(f"rank={emb['effective_rank']:.1f}")
-    dist_corr = topo.get("distance_corr_cross_seq", topo.get("distance_corr"))
-    rank_corr = topo.get("distance_rank_corr_cross_seq", topo.get("distance_rank_corr"))
-    knn = topo.get("knn_overlap_cross_seq", topo.get("knn_overlap"))
-    if dist_corr is not None:
-        parts.append(f"dist_corr={dist_corr:.3f}")
-    if rank_corr is not None:
-        parts.append(f"rank_corr={rank_corr:.3f}")
-    if knn is not None:
-        parts.append(f"knn={knn:.3f}")
-    if "latent_state_step_corr" in dyn:
-        parts.append(f"dyn_corr={dyn['latent_state_step_corr']:.3f}")
+    if "pred_target_cosine_distance_mean" in pred:
+        parts.append(f"pred_cos_dist={pred['pred_target_cosine_distance_mean']:.3f}")
+    if "rollout_cosine_distance_last_mean" in rollout:
+        parts.append(f"rollout_last={rollout['rollout_cosine_distance_last_mean']:.3f}")
+    if "cost_margin_mean" in planning:
+        parts.append(f"cost_margin={planning['cost_margin_mean']:.3f}")
+    if "expert_beats_random_rate" in planning:
+        parts.append(f"expert>{planning['expert_beats_random_rate']:.2f}")
+    if "distance_rank_corr_cross_seq" in ref:
+        parts.append(f"ref_rank={ref['distance_rank_corr_cross_seq']:.3f}")
     return " | ".join(parts)
 
 
@@ -98,17 +111,16 @@ def save_comparison_plot(
     fig, axes = plt.subplots(2, ncols, figsize=(6 * ncols, 10), squeeze=False)
 
     for col, dim in enumerate(color_dims):
-        key = f"state_{dim}"
-        if key not in left_rows[0] or key not in right_rows[0]:
-            raise KeyError(f"{key} not found in both projection files")
+        key_left = resolve_color_key(left_rows, dim)
+        key_right = resolve_color_key(right_rows, dim)
 
         left_x = [row["x"] for row in left_rows]
         left_y = [row["y"] for row in left_rows]
-        left_c = [row[key] for row in left_rows]
+        left_c = [row[key_left] for row in left_rows]
 
         right_x = [row["x"] for row in right_rows]
         right_y = [row["y"] for row in right_rows]
-        right_c = [row[key] for row in right_rows]
+        right_c = [row[key_right] for row in right_rows]
 
         vmin = min(min(left_c), min(right_c))
         vmax = max(max(left_c), max(right_c))
@@ -137,8 +149,8 @@ def save_comparison_plot(
             vmax=vmax,
         )
 
-        ax_l.set_title(f"{left_label} | {projection.upper()} | {key}")
-        ax_r.set_title(f"{right_label} | {projection.upper()} | {key}")
+        ax_l.set_title(f"{left_label} | {projection.upper()} | {key_left}")
+        ax_r.set_title(f"{right_label} | {projection.upper()} | {key_right}")
         ax_l.set_xlabel("x")
         ax_l.set_ylabel("y")
         ax_r.set_xlabel("x")
