@@ -321,7 +321,7 @@ def infonce_loss(
     labels = torch.arange(batch_size, device=pred.device)
     labels = labels.unsqueeze(1).expand(-1, pred.size(1)).reshape(-1)
     diag_mask = torch.eye(batch_size, dtype=torch.bool, device=pred.device).unsqueeze(1)
-    neg_inf = torch.finfo(q.dtype).min
+    neg_inf = torch.tensor(-float("inf"), dtype=pred.dtype, device=pred.device)
 
     def directional_loss(query: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
         cross_logits = torch.einsum("btd,jtd->btj", query, other) / temperature

@@ -7,7 +7,7 @@ cache_dir: null
 img_size: 224
 batch_size: 128
 num_workers: 4
-device: cpu
+device: cuda
 seed: 3072
 
 analysis:
