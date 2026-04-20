@@ -16,7 +16,9 @@ dump_object: True
 
 encoder:
   projection_head:
-    type: bn # linear, ln, or bn
+    type: linear # linear or mlp
+    norm_fn: batchnorm1d # none, layernorm, or batchnorm1d
+    hidden_dim: 2048 # only used when type=mlp
 
 trainer:
   max_epochs: 10
@@ -62,6 +64,10 @@ wm:
   history_size: 3
   num_preds: 1
   embed_dim: 64 # sphere is compact; start smaller than LeWM's 192
+  inference:
+    rollout_state_space: normalized # normalized or raw
+    cost_space: normalized # normalized or raw
+    cost_type: cosine # cosine or mse
 
 predictor:
   depth: 6
@@ -72,12 +78,19 @@ predictor:
   emb_dropout: 0.0
 
 loss:
+  pred:
+    type: cosine # cosine or mse
+    space: normalized # normalized or raw
+    context_space: ${loss.pred.space} # predictor context space during training
   regularizer:
     type: uniformity # spread, uniformity, or infonce
+    space: normalized # normalized or raw
     weight: 0.1 # λ balancing pred_loss vs anti-collapse regularization
   spread:
     margin: 0.0 # m in max(0, mu_i^T mu_j - m)^2
   uniformity:
     t: 2.0 # Wang & Isola temperature in log E[exp(-t ||mu_i - mu_j||^2)]
+    mode: all_pairs # all_pairs, cross_window, or temporal_masked
+    temporal_exclusion: 0 # only used by temporal_masked; exclude same-window pairs with |Δt| <= k
   infonce:
     temperature: 0.1 # symmetric InfoNCE at each time step; positives are aligned pred/target pairs, negatives include cross-view batch items and same-view non-self items

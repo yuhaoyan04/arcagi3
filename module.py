@@ -274,14 +274,63 @@ def spread_loss(emb: torch.Tensor, margin: float) -> torch.Tensor:
     return torch.clamp_min(_pairwise_offdiag(sim) - margin, 0.0).square().mean()
 
 
-def uniformity_loss(emb: torch.Tensor, t: float) -> torch.Tensor:
+def _uniformity_pair_mask(
+    batch_size: int,
+    seq_len: int,
+    *,
+    mode: str,
+    temporal_exclusion: int,
+    device,
+) -> torch.Tensor:
+    """Return the pair mask used by uniformity regularization."""
+    if temporal_exclusion < 0:
+        raise ValueError("uniformity temporal_exclusion must be >= 0")
+
+    n = batch_size * seq_len
+    upper = torch.triu(torch.ones(n, n, dtype=torch.bool, device=device), diagonal=1)
+    if mode == "all_pairs":
+        return upper
+
+    batch_ids = torch.arange(batch_size, device=device).repeat_interleave(seq_len)
+    if mode == "cross_window":
+        return upper & (batch_ids[:, None] != batch_ids[None, :])
+
+    if mode == "temporal_masked":
+        time_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+        near_temporal = (batch_ids[:, None] == batch_ids[None, :]) & (
+            (time_ids[:, None] - time_ids[None, :]).abs() <= temporal_exclusion
+        )
+        return upper & ~near_temporal
+
+    raise ValueError(f"Unsupported uniformity.mode: {mode}")
+
+
+def uniformity_loss(
+    emb: torch.Tensor,
+    t: float,
+    *,
+    mode: str = "all_pairs",
+    temporal_exclusion: int = 0,
+) -> torch.Tensor:
     """Wang & Isola uniformity loss on unit-normalized embeddings.
 
     emb: (B, T, D) — unit vectors on S^{d-1}.
-    Computes log mean_{i != j} exp(-t * ||mu_i - mu_j||^2).
+    Computes log mean exp(-t * ||mu_i - mu_j||^2) over a configurable subset
+    of flattened batch-time pairs.
     """
     z = emb.reshape(-1, emb.size(-1))  # (B*T, D)
-    sq_dists = torch.pdist(z, p=2).square()
+    if z.size(0) < 2:
+        return z.new_tensor(0.0)
+
+    sq_dists = torch.cdist(z, z, p=2).square()
+    mask = _uniformity_pair_mask(
+        emb.size(0),
+        emb.size(1),
+        mode=mode.lower(),
+        temporal_exclusion=temporal_exclusion,
+        device=z.device,
+    )
+    sq_dists = sq_dists[mask]
     if sq_dists.numel() == 0:
         return z.new_tensor(0.0)
     return torch.exp(-t * sq_dists).mean().log()
