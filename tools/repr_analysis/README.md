@@ -182,6 +182,7 @@ and edit:
 
 - `MODEL_SPECS`
 - `DATASET`
+- `INCLUDE_PLANNING`
 - `ANALYSIS_SAVE_DIR`
 - `EXPORT_DIR`
 - `EVAL_SCORES`
@@ -197,6 +198,11 @@ The notebook can:
 
 If you set `ANALYSIS_SAVE_DIR`, it also writes the usual per-model `summary.json`,
 projection JSONs, and local-neighbor reports.
+
+If your notebook runtime is pointed at an older checkout where `model.get_cost()`
+or planner-specific code paths are not compatible with every checkpoint, set
+`INCLUDE_PLANNING = False` in the notebook template. The rest of the embedding,
+prediction, rollout, and action-effect analysis will still run.
 
 The notebook saves:
 

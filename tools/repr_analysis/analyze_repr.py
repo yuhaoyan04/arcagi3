@@ -1089,7 +1089,7 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     emb = result["embedding"]
     pred = result["prediction"]
     rollout = result["rollout"]
-    planning = result["planning"]
+    planning = result.get("planning")
     act = result["action_effect"]
 
     hints: List[str] = []
@@ -1111,7 +1111,11 @@ def make_interpretation(dataset: str, result: Dict[str, Dict[str, float]]) -> Li
     elif rollout["rollout_cosine_distance_last_mean"] < 0.05:
         hints.append("Autoregressive rollout stays fairly consistent over the tested horizon.")
 
-    if planning["cost_margin_mean"] <= 0.0:
+    if not isinstance(planning, Mapping) or not planning:
+        hints.append("Planning probe is unavailable for this run; interpret rollout quality separately from planner quality.")
+    elif "error" in planning:
+        hints.append("Planning probe failed at runtime; inspect the stored planning.error field before drawing planner conclusions.")
+    elif planning["cost_margin_mean"] <= 0.0:
         hints.append("The model's cost does not prefer expert futures over random futures; planner guidance is likely too weak.")
     elif planning["expert_beats_best_random_rate"] < 0.4:
         hints.append("Expert futures beat the random mean but not the best random candidates often enough; planning signal is fragile.")
@@ -1769,6 +1773,7 @@ def run_analysis(
     knn_k: int,
     action_trials: int,
     planning_random_trials: int,
+    include_planning: bool,
     interp_steps: int,
     perturb_scale: float,
     seed: int,
@@ -1825,14 +1830,6 @@ def run_analysis(
         "embedding": analyze_embedding(outputs["emb"]),
         "prediction": analyze_prediction(pred, tgt),
         "rollout": analyze_rollout(rollout_pred, rollout_tgt),
-        "planning": analyze_planning_signal(
-            model,
-            outputs,
-            history_size=history_size,
-            future_steps=future_steps,
-            random_action_trials=planning_random_trials,
-            seed=seed,
-        ),
         "action_effect": analyze_action_effect(
             model,
             outputs,
@@ -1841,6 +1838,31 @@ def run_analysis(
             perturb_scale=perturb_scale,
         ),
     }
+
+    if include_planning:
+        try:
+            result["planning"] = analyze_planning_signal(
+                model,
+                outputs,
+                history_size=history_size,
+                future_steps=future_steps,
+                random_action_trials=planning_random_trials,
+                seed=seed,
+            )
+        except Exception as exc:
+            if log is not None:
+                log(f"[analyze_repr] warning: planning probe failed: {exc}")
+            result["planning"] = {
+                "error": f"{type(exc).__name__}: {exc}",
+                "planning_horizon": int(future_steps),
+                "random_action_trials": int(planning_random_trials),
+            }
+    else:
+        result["planning"] = {
+            "skipped": True,
+            "planning_horizon": int(future_steps),
+            "random_action_trials": int(planning_random_trials),
+        }
 
     if reference_state_key and "state" in outputs:
         result["reference_probe"] = analyze_reference_probe(
@@ -2173,6 +2195,7 @@ def run_batch_analysis(
     knn_k: int,
     action_trials: int,
     planning_random_trials: int,
+    include_planning: bool,
     interp_steps: int,
     perturb_scale: float,
     seed: int,
@@ -2225,6 +2248,7 @@ def run_batch_analysis(
             knn_k=knn_k,
             action_trials=action_trials,
             planning_random_trials=planning_random_trials,
+            include_planning=include_planning,
             interp_steps=interp_steps,
             perturb_scale=perturb_scale,
             seed=seed,
@@ -2348,6 +2372,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--knn-k", type=int, default=10)
     parser.add_argument("--action-trials", type=int, default=8)
     parser.add_argument("--planning-random-trials", type=int, default=16)
+    parser.add_argument(
+        "--skip-planning",
+        action="store_true",
+        help="Skip the planning-signal probe. Useful when comparing checkpoints whose planner code paths are unavailable or incompatible.",
+    )
     parser.add_argument("--interp-steps", type=int, default=9)
     parser.add_argument("--perturb-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=3072)
@@ -2410,6 +2439,7 @@ def main():
         knn_k=args.knn_k,
         action_trials=args.action_trials,
         planning_random_trials=args.planning_random_trials,
+        include_planning=not args.skip_planning,
         interp_steps=args.interp_steps,
         perturb_scale=args.perturb_scale,
         seed=args.seed,
