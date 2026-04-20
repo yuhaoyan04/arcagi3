@@ -287,14 +287,14 @@ class SphericalJEPA(JEPA):
             space=self._get_rollout_state_space(),
         ).clone()
 
-        act = rearrange(act_0, "b s ... -> (b s) ...")
-        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+        act_full = rearrange(action_sequence, "b s ... -> (b s) ...")
+        act_emb_full = self.action_encoder(act_full)
 
         HS = history_size
-        for t in range(n_steps):
-            act_emb = self.action_encoder(act)
+        for step in range(n_steps + 1):
+            action_end = H + step
             emb_trunc = rollout_state[:, -HS:]
-            act_trunc = act_emb[:, -HS:]
+            act_trunc = act_emb_full[:, action_end - HS : action_end]
             pred_raw = self.predict_raw(emb_trunc, act_trunc)[:, -1:]
             pred_norm = self.normalize_embeddings(pred_raw)
             pred_state = self._select_embedding_space(
@@ -306,24 +306,6 @@ class SphericalJEPA(JEPA):
             rollout_raw = torch.cat([rollout_raw, pred_raw], dim=1)
             rollout_norm = torch.cat([rollout_norm, pred_norm], dim=1)
             rollout_state = torch.cat([rollout_state, pred_state], dim=1)
-
-            next_act = act_future[:, t : t + 1, :]
-            act = torch.cat([act, next_act], dim=1)
-
-        act_emb = self.action_encoder(act)
-        emb_trunc = rollout_state[:, -HS:]
-        act_trunc = act_emb[:, -HS:]
-        pred_raw = self.predict_raw(emb_trunc, act_trunc)[:, -1:]
-        pred_norm = self.normalize_embeddings(pred_raw)
-        pred_state = self._select_embedding_space(
-            emb_raw=pred_raw,
-            emb_norm=pred_norm,
-            space=self._get_rollout_state_space(),
-        )
-
-        rollout_raw = torch.cat([rollout_raw, pred_raw], dim=1)
-        rollout_norm = torch.cat([rollout_norm, pred_norm], dim=1)
-        rollout_state = torch.cat([rollout_state, pred_state], dim=1)
 
         info["predicted_emb_raw"] = rearrange(rollout_raw, "(b s) ... -> b s ...", b=B, s=S)
         info["predicted_emb"] = rearrange(rollout_norm, "(b s) ... -> b s ...", b=B, s=S)
