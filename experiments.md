@@ -461,3 +461,283 @@ In other words, the important consistency is along the **dynamics path**:
 
 The current hybrid `raw pred + normalized rollout + raw cost` setup does not
 meet that requirement and should not be treated as the main raw-MSE baseline.
+
+---
+
+## PushT Ablation: Uniformity Weight, Pair Sampling, and Temporal Exclusion
+
+To understand which part of the SWM regularizer stack actually matters on
+PushT, we ran a focused ablation with fixed evaluation settings:
+
+- training checkpoint: `epoch=10`
+- evaluation budget: `num_eval=500`
+- dataset / task: `PushT`
+
+Important notation for this section:
+
+- `t` = uniformity temperature
+- `temporal_masked_k` = `loss.uniformity.mode=temporal_masked` with
+  `temporal_exclusion=k`
+
+### PushT ablation snapshot
+
+| Model | PushT eval |
+|---|---:|
+| `lewm` | **89.4** |
+| `swm_mlp_bn_uniform_w_0p1_t_2_dim_192` | 65.6 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_192` | 74.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` | pending |
+| `swm_mlp_bn_uniform_w_0p1_t_2_cross_window_dim_192` | 74.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_cross_window_dim_192` | 80.2 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_cross_window_dim_64` | 82.2 |
+| `swm_mlp_bn_uniform_w_0p1_t_2_temporal_masked_1_dim_192` | 71.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_1_dim_192` | 80.0 |
+| `swm_mlp_bn_uniform_w_0p2_t_1_temporal_masked_1_dim_64` | 64.6 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_1_dim_64` | 81.2 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` | **89.8** |
+
+### Main takeaways
+
+1. Increasing `uniform_w` from `0.1` to `0.2` helps consistently.
+2. Changing pair sampling from `all_pairs` to `cross_window` or
+   `temporal_masked` matters more than changing the base MLP+BN backbone alone.
+3. In the structured variants tested so far, `dim=64` is at least competitive
+   with and often better than `dim=192`.
+4. The biggest gain comes from raising `temporal_exclusion` from `1` to `2`
+   inside `temporal_masked`.
+5. The current best SWM run (`89.8`) is effectively on par with `lewm` (`89.4`)
+   under `num_eval=500`; this is a promising tie, not yet a decisive win.
+
+### Controlled comparisons
+
+#### Effect of uniformity weight
+
+At fixed `t=2`:
+
+| Setting | `uniform_w=0.1` | `uniform_w=0.2` | Gain |
+|---|---:|---:|---:|
+| `all_pairs`, `dim=192` | 65.6 | 74.4 | +8.8 |
+| `cross_window`, `dim=192` | 74.4 | 80.2 | +5.8 |
+| `temporal_masked_1`, `dim=192` | 71.4 | 80.0 | +8.6 |
+
+Interpretation: `uniform_w=0.1` is too weak in this PushT setting; `0.2`
+consistently improves downstream control.
+
+#### Effect of pair sampling / structural bias
+
+At fixed `uniform_w=0.2`, `t=2`, `dim=192`:
+
+| Setting | PushT eval |
+|---|---:|
+| `all_pairs` | 74.4 |
+| `cross_window` | 80.2 |
+| `temporal_masked_1` | 80.0 |
+
+Interpretation: the main benefit is not just stronger uniformity, but applying
+it with a more appropriate pair-selection structure. Both `cross_window` and
+`temporal_masked` avoid over-penalizing temporally related samples compared with
+plain `all_pairs`.
+
+#### Effect of latent dimension
+
+At fixed `uniform_w=0.2`, `t=2`:
+
+| Setting | `dim=192` | `dim=64` | Gain |
+|---|---:|---:|---:|
+| `cross_window` | 80.2 | 82.2 | +2.0 |
+| `temporal_masked_1` | 80.0 | 81.2 | +1.2 |
+
+Interpretation: reducing latent dimension does not hurt the structured SWM
+variants here, and may slightly improve generalization. The plain
+`all_pairs, dim=64` baseline is still missing, so this should be treated as a
+trend rather than a fully isolated dimension conclusion.
+
+#### Effect of temperature `t`
+
+For `temporal_masked_1`, `uniform_w=0.2`, `dim=64`:
+
+| `t` | PushT eval |
+|---|---:|
+| 1 | 64.6 |
+| 2 | 81.2 |
+
+Interpretation: `t=2` is much better than `t=1` in the currently tested
+configuration. This is a strong signal that the uniformity temperature matters,
+but it is still based on one architecture slice rather than a full sweep.
+
+#### Effect of temporal exclusion
+
+At fixed `uniform_w=0.2`, `t=2`, `dim=64`:
+
+| Setting | PushT eval |
+|---|---:|
+| `temporal_masked_1` | 81.2 |
+| `temporal_masked_2` | **89.8** |
+
+Interpretation: increasing `temporal_exclusion` from `1` to `2` is the largest
+single improvement in this ablation. The most plausible explanation is that
+excluding a wider near-temporal neighborhood makes the repulsive uniformity
+signal less likely to fight against genuinely similar adjacent states.
+
+### Updated working interpretation for PushT
+
+The strongest SWM result in this batch does not come from larger capacity. It
+comes from a better match between the uniformity objective and PushT's temporal
+structure:
+
+- strong enough regularization (`uniform_w=0.2`)
+- pair selection that respects temporal locality
+- a moderate uniformity temperature (`t=2`)
+- larger temporal exclusion (`temporal_exclusion=2`)
+- compact latent size (`dim=64`)
+
+This suggests that for PushT, regularizer geometry and temporal sampling policy
+matter more than simply scaling embedding dimension.
+
+### Remaining gaps
+
+- `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` is still pending, so the plain
+  `all_pairs` dimension effect is not fully isolated.
+- The current `89.8` vs `89.4` comparison against `lewm` is within plausible
+  evaluation noise for `num_eval=500`; multi-seed confirmation is still needed.
+- We still need `temporal_masked_2_dim_192` to separate the effect of
+  `temporal_exclusion=2` from any interaction with `dim=64`.
+
+### Experiment record additions
+
+#### Exp 12: PushT baseline sweep with MLP+BN + uniformity (`all_pairs`)
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- projector: `MLP + BatchNorm1d`
+- pair mode: `all_pairs`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, dim=192` | 65.6 |
+| `uniform_w=0.2, t=2, dim=192` | 74.4 |
+| `uniform_w=0.2, t=2, dim=64` | pending |
+
+Interpretation:
+- The plain `all_pairs` variant is clearly weaker than the best structured
+  variants.
+- Even here, `uniform_w=0.2` provides a substantial gain over `0.1`.
+
+#### Exp 13: PushT `cross_window` ablation
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- pair mode: `cross_window`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, dim=192` | 74.4 |
+| `uniform_w=0.2, t=2, dim=192` | 80.2 |
+| `uniform_w=0.2, t=2, dim=64` | 82.2 |
+
+Interpretation:
+- Restricting uniformity pairs to cross-window pairs improves over the
+  `all_pairs` baseline.
+- The gain from `uniform_w=0.2` remains.
+- `dim=64` is slightly stronger than `dim=192` in this structured setting.
+
+#### Exp 14: PushT `temporal_masked` ablation
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- pair mode: `temporal_masked`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, temporal_exclusion=1, dim=192` | 71.4 |
+| `uniform_w=0.2, t=2, temporal_exclusion=1, dim=192` | 80.0 |
+| `uniform_w=0.2, t=1, temporal_exclusion=1, dim=64` | 64.6 |
+| `uniform_w=0.2, t=2, temporal_exclusion=1, dim=64` | 81.2 |
+| `uniform_w=0.2, t=2, temporal_exclusion=2, dim=64` | **89.8** |
+
+Interpretation:
+- `temporal_masked` is competitive with `cross_window` at
+  `temporal_exclusion=1`.
+- `t=1` is too weak or poorly calibrated for this branch.
+- Increasing `temporal_exclusion` to `2` produces the best result in the whole
+  SWM PushT sweep and essentially matches the current `lewm` reference.
+
+### Next runs for PushT
+
+The current ablation is already enough to identify the most promising branch,
+but two comparisons are still missing before we can claim a clean causal story.
+
+#### Priority 1: isolate the plain `dim=64` effect
+
+Pending run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` | separate the benefit of lower dimension from the benefit of `cross_window` / `temporal_masked` |
+
+Why this matters:
+- Right now `dim=64` only looks better inside the structured variants.
+- Without the plain `all_pairs, dim=64` result, we cannot tell whether lower
+  dimension is broadly helpful or only helpful when combined with better pair
+  selection.
+
+#### Priority 2: isolate the `temporal_exclusion=2` effect
+
+Recommended run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_192` | test whether the large gain from `temporal_exclusion=2` persists at higher latent dimension |
+
+Why this matters:
+- The current best run combines two changes at once: `temporal_exclusion=2` and
+  `dim=64`.
+- This leaves an unresolved interaction question: is `temporal_exclusion=2`
+  intrinsically strong, or is it especially strong only in the smaller latent
+  space?
+
+#### Priority 3: confirm temperature choice near the best branch
+
+Recommended run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_1_temporal_masked_2_dim_64` | check whether the temperature sensitivity seen for `temporal_masked_1` also holds at `temporal_exclusion=2` |
+
+Why this matters:
+- The current evidence says `t=2` is much better than `t=1` for
+  `temporal_masked_1`.
+- We do not yet know whether the same conclusion holds for the strongest branch.
+
+#### Priority 4: move from best single run to stable best setting
+
+Recommended protocol:
+- rerun `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` with multiple
+  seeds
+- report mean and standard deviation instead of only the best single result
+
+Why this matters:
+- `89.8` vs `lewm 89.4` is too close to claim superiority from a single run.
+- The next real milestone is not a slightly higher point estimate, but showing
+  that the best SWM setting is reliably competitive with `lewm`.
+
+### Current recommendation
+
+If compute budget is limited, the cleanest next sequence is:
+
+1. run `swm_mlp_bn_uniform_w_0p2_t_2_dim_64`
+2. run `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_192`
+3. rerun `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` with multiple
+   seeds
+
+This sequence first resolves the two main ablation ambiguities, then shifts the
+goal from exploration to statistical confirmation.
