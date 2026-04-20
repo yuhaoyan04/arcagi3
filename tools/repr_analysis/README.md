@@ -24,8 +24,6 @@ The goal is not just to ask "did the model avoid collapse?", but to answer:
   Editable Jupyter notebook template that imports only `analyze_repr.py`.
 - [run_repr_batch_example.sh](/home/ag/projects/le-wm/tools/repr_analysis/run_repr_batch_example.sh)
   Editable shell example that wraps the batch script for multi-model comparison.
-- [probe.py](/home/ag/projects/le-wm/probe.py)
-  Older lightweight probing script. Still useful, but less systematic.
 
 ## What To Use When
 
