@@ -293,8 +293,11 @@ class SphericalJEPA(JEPA):
         HS = history_size
         for step in range(n_steps + 1):
             action_end = H + step
-            emb_trunc = rollout_state[:, -HS:]
-            act_trunc = act_emb_full[:, action_end - HS : action_end]
+            # Match the original "take up to the last HS steps" behavior even
+            # when the available prefix is shorter than HS.
+            window = min(HS, action_end)
+            emb_trunc = rollout_state[:, -window:]
+            act_trunc = act_emb_full[:, action_end - window : action_end]
             pred_raw = self.predict_raw(emb_trunc, act_trunc)[:, -1:]
             pred_norm = self.normalize_embeddings(pred_raw)
             pred_state = self._select_embedding_space(
