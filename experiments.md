@@ -1,0 +1,743 @@
+# SWM (Spherical World Model) Experiment Log
+
+## Summary
+
+Goal: spherical representations (S^{d-1}) + non-SIGReg anti-collapse for world models (plan.md / plan_v2.md V0).
+
+Base config: SphericalJEPA, ViT-Tiny, embed_dim=64, batch_size=128, T=4, Two-Room, lr=5e-5, spread weight=0.1.
+
+### Uniformity_loss scale reference (t=2, N=512)
+
+| State | uniformity_loss value | Meaning |
+|-------|----------------------|---------|
+| Full collapse (all z_i identical) | **6.24** = log(511) | All sq_dist=0, exp(0)=1 |
+| Random 64D unit vectors | **≈2.2** = log(511·e⁻⁴) | avg sq_dist≈2 |
+| Well-spread | **< 2.2** | avg sq_dist > 2 |
+
+### Mean cosine spread_loss scale reference
+
+| State | spread_loss value |
+|-------|------------------|
+| Full collapse | **1.0** (all cosine sim = 1) |
+| Random 64D unit vectors | **≈0.0** |
+
+### Sliced spread_loss scale reference (`D=64`)
+
+| State | sliced_spread_loss value | Meaning |
+|-------|--------------------------|---------|
+| Full collapse | **≈0.03121** (`≈ 2 / D`) | Sorted projections all equal to one constant |
+| Random 64D unit vectors | **≈8e-5** | Projection order statistics match target quantiles |
+| Well-spread | **→ 0** | 1D marginals close to uniform-on-sphere target |
+
+### Results overview
+
+| # | Approach | Loss type | Init spread | E0 fit spread | E0 val spread | Collapse broken? | Failure mode |
+|---|----------|-----------|-------------|--------------|---------------|-----------------|--------------|
+| 1 | Linear + mean cosine | cosine | 1.0 | 1.0 | 1.0 | No | Gradient dead zone |
+| 2 | + detach target | cosine | 1.0 | 1.0 | 1.0 | No | Gradient dead zone |
+| 3 | InfoNCE (τ=0.1) | InfoNCE | 16.24 | 16.24→7.55(E8) | 7.57 | E1 violent break | Destroys temporal structure |
+| 4 | MLP+BN projector | cosine | 1.0 | **0.006** | **1.0** | Train only | Batch masking |
+| 5 | + LayerNorm pre-L2 | cosine | 1.0 | 1.0 | 1.0 | No | Gradient dead zone |
+| 6 | + noise (σ=1e-2) | cosine | 1.0 | 1.0 | 1.0 | No | Gradient dead zone |
+| 7 | variance_loss on emb_raw | variance | 0.996 | 1.0 | 1.0 | No | Gradient dead zone (0/0) |
+| 8 | DINO centering + uniformity | uniformity | 6.24 | **3.94** | **6.24** | Train only | Batch masking |
+| 9 | uniformity_loss only (no centering) | uniformity | 6.24 | 6.24 | 6.23 | No | Gradient dead zone |
+| 10 | sliced Wasserstein on sphere | sliced | 0.03296 | — | 0.03126 (E99) | No | Weak signal after L2 normalisation |
+| 11 | MLP+BN + uniformity | uniformity | 4.28 | 2.83 | 4.28 | Yes | Slow BN / running-stats alignment |
+
+### Three failure modes
+
+| Mode | Experiments | Mechanism |
+|------|------------|-----------|
+| **Gradient dead zone** | 1, 2, 5, 6, 7, 9 | At collapse all z_i identical → (z_i−z_j)=0, std=0/0 → zero gradient |
+| **Batch-dependent masking** | 4, 8 | BN / centering creates diversity during training only → loss gets no corrective signal → eval reveals true collapse |
+| **Temporal destruction** | 3 | InfoNCE pushes ALL pairs apart (including adjacent frames) → conflicts with pred_loss |
+| **Weak post-norm signal** | 10 | Sorting gives gradient, but L2 normalisation already erased most cross-sample variation |
+| **Slow but real escape** | 11 | BN creates useful perturbation; eval lags early, then running stats catch up and collapse is broken |
+
+### Root cause
+
+Random ViT CLS tokens = shared component (v, magnitude ~10) + input-dependent variation (ε_i, magnitude ~0.01). L2 normalisation maps v+ε_i to v/||v|| ≈ same unit vector for all i, killing the ε_i signal. This is unique to spherical architectures — LeWM in R^d preserves ε_i and SIGReg's sorting mechanism detects it.
+
+### What works (SIGReg) and why
+
+SIGReg succeeds because of **sorting + quantile matching** inside Epps-Pulley: project embeddings to random 1D direction → sort → compare sorted values against Gaussian characteristic function. Sorting assigns different ranks to identical values, providing non-zero gradient at exact collapse. No batch-dependence, no pairwise differences.
+
+---
+
+## Experiment Details
+
+### Exp 1: V0 Baseline (Linear + mean cosine spread_loss)
+
+**Config**: `nn.Linear(hidden_dim, embed_dim)` projector, spread_loss = mean pairwise cosine, weight=0.1.
+
+| Stage | pred_loss | spread_loss | loss |
+|-------|-----------|-------------|------|
+| Init | 1.061 | 1.0 | 1.162 |
+| E3 fit | 2.1e-5 | 1.0 | 0.100 |
+| E3 val | 2.6e-5 | 1.0 | 0.100 |
+
+Complete collapse. Predictor trivially outputs constant.
+
+---
+
+### Exp 2: + detach() on target
+
+**Change**: `tgt_emb = emb[:, n_preds:].detach()`.
+
+No improvement. Collapse is in the encoder, not gradient flow through target.
+
+---
+
+### Exp 3: InfoNCE spread_loss (τ=0.1)
+
+**Change**: `logsumexp(sim/τ)`. InfoNCE scale: collapse=16.24, random=6.24.
+
+| Stage | pred_loss | spread_loss |
+|-------|-----------|-------------|
+| Init | 1.080 | 16.236 (collapse) |
+| E0 fit | 0.001 | 16.236 (still collapsed) |
+| E1 fit | 0.966 | 9.286 (broke out) |
+| E8 fit | 0.875 | 7.551 (near random) |
+| E8 val | 0.879 | 7.573 |
+
+Broke collapse at E1 via float noise accumulation, but pred_loss jumped to untrained level (0.97) and barely recovered. InfoNCE pushes temporal neighbours apart, directly opposing pred_loss.
+
+---
+
+### Exp 4: MLP projector with BatchNorm
+
+**Change**: `MLP(hidden_dim, 2048, embed_dim, norm_fn=BatchNorm1d)`.
+
+| Stage | pred_loss | spread_loss (cosine) |
+|-------|-----------|---------------------|
+| Init | 0.935 | 1.0 |
+| E0 fit | 0.049 | **0.006** |
+| E0 val | 0.017 | **1.0** |
+
+Train/val split: BN decorrelates during training (batch stats) → spread sees no collapse → no corrective gradient. Eval with running stats → collapse exposed.
+
+---
+
+### Exp 5: LayerNorm before L2 normalize
+
+| Stage | pred_loss | spread_loss (cosine) |
+|-------|-----------|---------------------|
+| Init | 1.104 | 1.0 |
+| E0 fit | 4.5e-4 | 1.0 |
+
+LayerNorm is per-sample. Doesn't fix cross-sample similarity.
+
+---
+
+### Exp 6: Noise injection (σ=1e-2)
+
+| Stage | pred_loss | spread_loss (cosine) |
+|-------|-----------|---------------------|
+| Init | 0.880 | 1.0 |
+| E0 fit | 6.0e-4 | 1.0 |
+
+σ=1e-2 negligible vs embedding magnitude (~10). Angular perturbation ≈ 0.001 rad.
+
+---
+
+### Exp 7: variance_loss on pre-L2-norm embeddings
+
+**Change**: `clamp(1 - std_per_dim, min=0).mean()` on emb_raw.
+
+| Stage | pred_loss | spread_loss (variance) |
+|-------|-----------|----------------------|
+| Init | 1.138 | 0.996 |
+| E0 fit | 7.9e-4 | 1.0 |
+
+variance gradient = (x_i − mean)/(N·std) = 0/0 at collapse. PyTorch resolves to 0.
+
+---
+
+### Exp 8: DINO centering + uniformity_loss
+
+**Change**: Subtract batch mean (train) / EMA center (eval) before L2 norm. uniformity_loss (t=2) on normalised embeddings.
+
+| Stage | pred_loss | spread_loss (uniformity) |
+|-------|-----------|--------------------------|
+| Init | 1.053 | 6.236 (= collapse) |
+| E0 fit | 0.986 | **3.935** (partially spread) |
+| E0 val | 0.350 | **6.235** (= collapse) |
+
+Same pattern as Exp 4: centering creates diversity during training (fit spread improved), but eval with EMA center still collapsed. Centering ≈ BN = batch-dependent operation that masks collapse from the loss.
+
+---
+
+### Exp 9: uniformity_loss only (no centering, Linear projector)
+
+Isolate uniformity_loss without any architectural changes to confirm baseline behaviour.
+
+| Stage | pred_loss | spread_loss (uniformity) |
+|-------|-----------|--------------------------|
+| Init | 0.932 | 6.236 (= collapse) |
+| E0 fit | 6.2e-4 | 6.236 (= collapse) |
+| E0 val | 8.3e-5 | 6.235 (= collapse) |
+
+Complete collapse. uniformity_loss has zero gradient at collapse (same dead zone as other pairwise losses).
+
+---
+
+### Exp 10: sliced_spread_loss (sorting + quantile matching on sphere)
+
+**Change**: replace pairwise/uniformity spread loss with `sliced_spread_loss()`:
+- project all `B*T` unit vectors onto random directions
+- sort projections independently per direction
+- match sorted values against `N(0, 1/D)` quantiles
+
+Training command:
+
+```bash
+python train_swm.py --config-name=swm.yaml \
+    data=tworoom \
+    subdir=ckpt/swm_v0_20260414_exp10_sliced_spread_loss \
+    wandb.enabled=False
+```
+
+Config: `embed_dim=64`, `spread.weight=0.1`, `n_projections=256`.
+
+| Stage | pred_loss | spread_loss (sliced) | loss |
+|-------|-----------|----------------------|------|
+| Init val sanity check | 0.9465 | 0.03296 | 0.94979 |
+| E99 fit | 5.31e-6 | 0.03351 | 0.003356 |
+| E99 val | 4.98e-6 | 0.03126 | 0.003131 |
+
+Interpretation:
+- `pred_loss` goes essentially to zero, so the predictor learns the trivial constant-latent solution perfectly.
+- `spread_loss` stays almost exactly at the collapse baseline from start to finish.
+- Unlike Exp 4 / 8, fit and val agree: this is **not** batch masking.
+- Therefore sorting provides a non-zero gradient in principle, but in the current spherical pipeline that signal is too weak to move the model away from the collapsed basin.
+
+Likely mechanism:
+- The loss is applied **after** L2 normalisation on `S^{d-1}`.
+- Earlier experiments already suggested raw ViT CLS features look like `v + ε`, where `||v|| >> ||ε||`.
+- L2 normalisation maps `v + ε` close to `v / ||v||`, suppressing the useful variation before the spread loss sees it.
+- `sliced_spread_loss` avoids the exact zero-gradient dead zone, but it still cannot overcome the trivial predictor solution once the representation has already been angularly flattened.
+
+---
+
+### Exp 11: MLP+BatchNorm projector + uniformity_loss
+
+**Change**:
+- use the original LeWM-style `MLP(..., BatchNorm1d)` projector and predictor projector
+- keep spherical encoder / predictor outputs (`L2` normalised)
+- use `uniformity_loss(t=2)` as spread loss
+
+Training run:
+- SwanLab run: `swm_v0_bn_uniform_lambda_0p1_t_2_20260415`
+- URL: `https://swanlab.cn/@qunteam/worldmodels/runs/x3poay2amzei0vi6f1rlt/chart`
+
+Config: `embed_dim=64`, `spread.weight=0.1`, `spread.type=uniformity`, `t=2.0`.
+
+| Stage | pred_loss | spread_loss (uniformity) | loss |
+|-------|-----------|--------------------------|------|
+| Early fit (step 49) | 0.9712 | 2.8337 | 1.2545 |
+| Early val (epoch 1) | 0.1814 | 4.2845 | 0.6098 |
+| Mid fit peak spread (step 299) | 0.0247 | 6.0299 | 0.6277 |
+| Final fit (step 128399) | 0.0060 | 2.4655 | 0.2526 |
+| Final val (epoch 99) | 0.00220 | 2.4712 | 0.2493 |
+
+Interpretation:
+- This is **not** the Exp 4 / Exp 8 failure mode.
+- Validation spread does **not** stay near the collapse baseline (`6.24`); it falls to `2.47`, close to the random-spread reference (`≈2.2`).
+- Validation pred loss also goes very low (`0.181 -> 0.0022`), so the model is not merely decorrelated in training mode.
+- Therefore BN + uniformity appears to be the first spherical variant that **really escapes collapse on validation**, not just on train.
+
+Training dynamics:
+- Early on, train and validation both fluctuate strongly.
+- Fit spread initially rises toward the collapse scale (`≈6`), while validation spread is still high and noisy.
+- After several epochs, validation rapidly improves and then stabilises around `2.47`.
+- This suggests BN is doing more than masking: it injects enough cross-sample variation to break symmetry, but eval-mode running statistics need time to align before that benefit appears on validation.
+
+Updated judgement on BatchNorm:
+- Exp 4 was too pessimistic as a universal conclusion.
+- BN still carries a train/eval mismatch risk.
+- But at least in this long-run BN+uniformity setting, the mismatch is **transient**, not permanent masking.
+- The most accurate description is: **slow-starting but genuinely non-collapsed**.
+
+Remaining caveat:
+- These metrics show that the representation escapes collapse.
+- They do **not yet** prove better downstream planning / control performance.
+- Exp 11 should therefore be treated as a promising positive result pending evaluation.
+
+---
+
+## Key Insight: The Gradient Dead Zone
+
+At exact collapse (all z_i identical), gradient is zero for ALL tested losses:
+
+| Loss type | Why zero at collapse |
+|-----------|---------------------|
+| Pairwise (cosine, uniformity, InfoNCE) | (z_i − z_j) = 0 |
+| Statistical (variance, covariance) | (x_i − mean) = 0, std = 0 → 0/0 |
+| Gram matrix on post-norm | Gradient ∝ (G−I)z₀, killed by L2 Jacobian (I−z₀z₀ᵀ)z₀ = 0 |
+
+**Mechanisms now known to work**:
+- sorting + quantile matching (used inside SIGReg's Epps-Pulley)
+- BatchNorm-assisted uniformity, when trained long enough for eval running statistics to align
+
+Sorting assigns different ranks to identical values → different target quantiles → non-zero gradient. Does not involve (z_i − z_j) or batch statistics.
+
+### Updated interpretation after Exp 10
+
+Exp 10 refines the conclusion:
+- Sorting is likely **necessary** to escape exact collapse.
+- But sorting **on post-L2 spherical embeddings is not sufficient**.
+- The remaining bottleneck is probably the representation pipeline itself: useful variation is destroyed by early normalisation, so the spread objective receives too little signal too late.
+
+This points to the next design direction:
+- keep spherical prediction / planning if desired
+- but apply anti-collapse regularisation on **pre-normalised** projector outputs, where the small non-collapsed variation still exists
+- or otherwise preserve / amplify that variation before projecting to the sphere
+
+### Updated again after Exp 11
+
+Exp 11 further refines the picture:
+- BatchNorm can be more than batch masking.
+- When combined with uniformity and trained long enough, it can provide a real route out of collapse.
+- The apparent contradiction with Exp 4 is explained by time scale: early validation can look worse before BN running statistics catch up.
+
+So the current picture is:
+- post-L2 linear projector + pairwise/statistical spread losses: fail
+- post-L2 sliced spread alone: fail
+- BN + uniformity: **promising success**
+- SIGReg in Euclidean space: still the cleanest known robust baseline
+
+---
+
+## PushT Follow-up: Rollout-Space Consistency
+
+After the early collapse-focused Two-Room experiments, we ran a stricter PushT
+comparison to answer a different question:
+
+> when prediction is trained in one latent space, does planning also need to
+> roll out in that same space?
+
+The short answer from the current runs is **yes**.
+
+### PushT comparison snapshot
+
+| Model | Prediction training space | Rollout state space | Final cost space | PushT eval | Main representation takeaway |
+|---|---|---|---|---|---|
+| LeWM / SIGReg | raw MSE in Euclidean space | raw | raw MSE | **94** | Best global geometry and strongest action-driven latent motion |
+| SWM Exp A: BN + norm cosine + norm uniformity | normalized cosine | normalized | normalized cosine | **62** | Self-consistent rollout, but geometry is weaker than LeWM |
+| SWM Exp B2: BN + raw MSE + norm uniformity | raw MSE | normalized | raw MSE | **0** | Train / rollout mismatch; changing only final cost does not rescue planning |
+
+### Representation evidence from PushT
+
+The representation analysis makes the failure mode clearer:
+
+- Exp A (`BN + norm_cosine + norm_uniformity`) still has imperfect geometry, but
+  it retains usable local dynamics:
+  - `distance_rank_corr_cross_seq = 0.046`
+  - `knn_overlap_cross_seq = 0.225`
+  - `latent_state_step_corr = 0.365`
+  - `pred_target_cosine_mean = 0.994`
+- Exp B2 (`BN + raw_mse + norm_uniformity`, but `rollout_state_space=normalized`)
+  breaks much more severely:
+  - `distance_rank_corr_cross_seq = 0.045`
+  - `knn_overlap_cross_seq = 0.037`
+  - `latent_state_step_corr = -0.133`
+  - `pred_target_cosine_mean = 0.239`
+  - `mean_pred_shift_norm = 0.347`
+
+Interpretation:
+
+- Exp A is bad mainly because its geometry is weaker than LeWM, not because the
+  planner uses the wrong space.
+- Exp B2 is worse because the predictor is trained with `pred.space=raw`, but
+  planning still closes the autoregressive loop in `rollout_state_space=normalized`.
+- This shows that matching the **prediction-loss space** to the **rollout space**
+  matters more than matching only the final planning cost.
+
+### Additional raw-vs-normalized check
+
+We then extended `repr_analysis` to report both normalized and raw embedding /
+topology metrics for hybrid models.
+
+For the current BN-based raw-MSE run, raw and normalized geometry turned out to
+be almost identical. That means:
+
+- the failure is **not** mainly caused by the final `L2 normalize()`
+- `emb_raw` is already close to a fixed-norm thin shell, so raw space does not
+  preserve much extra amplitude information
+- with this architecture, switching only `cost_space` cannot rescue planning
+
+This points away from "cost mismatch only" and toward a stronger conclusion:
+
+> the prediction training space and the rollout state space should be the same
+> if we want stable multi-step planning.
+
+### Recommended consistent experiment lines
+
+The next comparison should therefore use two fully self-consistent branches
+rather than another hybrid.
+
+### Exp C1: spherical-consistent
+
+Use this to measure the best version of the spherical branch without changing
+its core geometry.
+
+```yaml
+encoder:
+  projection_head:
+    type: mlp
+    norm_fn: batchnorm1d
+
+loss:
+  pred:
+    type: cosine
+    space: normalized
+  regularizer:
+    type: uniformity
+    space: normalized
+    weight: 0.1
+
+wm:
+  inference:
+    rollout_state_space: normalized
+    cost_space: normalized
+    cost_type: cosine
+```
+
+Why this branch matters:
+
+- it keeps training, rollout, and planning in the same spherical space
+- it is the clean follow-up to Exp A
+- any remaining gap to LeWM can then be attributed to geometry quality, not
+  train / rollout inconsistency
+
+### Exp C2: raw-consistent
+
+Use this to test whether raw-MSE dynamics actually become useful once the
+predictor is trained and rolled out in the same raw space.
+
+```yaml
+encoder:
+  projection_head:
+    type: mlp
+    norm_fn: none
+
+loss:
+  pred:
+    type: mse
+    space: raw
+  regularizer:
+    type: uniformity
+    space: normalized
+    weight: 0.1
+
+wm:
+  inference:
+    rollout_state_space: raw
+    cost_space: raw
+    cost_type: mse
+```
+
+Why this branch matters:
+
+- it aligns prediction loss, rollout, and final planning cost in raw space
+- it directly tests the "raw dynamics" hypothesis instead of only changing the
+  terminal cost
+- removing `BatchNorm1d` from the projector is important here, because the
+  current BN-based raw run suggests `emb_raw` is already being compressed into a
+  near-shell geometry before planning ever sees it
+
+### Working hypothesis after PushT
+
+Current evidence supports the following rule of thumb:
+
+- `pred.space` should match `rollout_state_space`
+- `cost_space` should usually match them too
+- `regularizer.space` may differ if needed
+
+In other words, the important consistency is along the **dynamics path**:
+
+> prediction target space = autoregressive rollout space = planning space
+
+The current hybrid `raw pred + normalized rollout + raw cost` setup does not
+meet that requirement and should not be treated as the main raw-MSE baseline.
+
+---
+
+## PushT Ablation: Uniformity Weight, Pair Sampling, and Temporal Exclusion
+
+To understand which part of the SWM regularizer stack actually matters on
+PushT, we ran a focused ablation with fixed evaluation settings:
+
+- training checkpoint: `epoch=10`
+- evaluation budget: `num_eval=500`
+- dataset / task: `PushT`
+
+Important notation for this section:
+
+- `t` = uniformity temperature
+- `temporal_masked_k` = `loss.uniformity.mode=temporal_masked` with
+  `temporal_exclusion=k`
+
+### PushT ablation snapshot
+
+| Model | PushT eval |
+|---|---:|
+| `lewm` | **89.4** |
+| `swm_mlp_bn_uniform_w_0p1_t_2_dim_192` | 65.6 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_192` | 74.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` | pending |
+| `swm_mlp_bn_uniform_w_0p1_t_2_cross_window_dim_192` | 74.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_cross_window_dim_192` | 80.2 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_cross_window_dim_64` | 82.2 |
+| `swm_mlp_bn_uniform_w_0p1_t_2_temporal_masked_1_dim_192` | 71.4 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_1_dim_192` | 80.0 |
+| `swm_mlp_bn_uniform_w_0p2_t_1_temporal_masked_1_dim_64` | 64.6 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_1_dim_64` | 81.2 |
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` | **89.8** |
+
+### Main takeaways
+
+1. Increasing `uniform_w` from `0.1` to `0.2` helps consistently.
+2. Changing pair sampling from `all_pairs` to `cross_window` or
+   `temporal_masked` matters more than changing the base MLP+BN backbone alone.
+3. In the structured variants tested so far, `dim=64` is at least competitive
+   with and often better than `dim=192`.
+4. The biggest gain comes from raising `temporal_exclusion` from `1` to `2`
+   inside `temporal_masked`.
+5. The current best SWM run (`89.8`) is effectively on par with `lewm` (`89.4`)
+   under `num_eval=500`; this is a promising tie, not yet a decisive win.
+
+### Controlled comparisons
+
+#### Effect of uniformity weight
+
+At fixed `t=2`:
+
+| Setting | `uniform_w=0.1` | `uniform_w=0.2` | Gain |
+|---|---:|---:|---:|
+| `all_pairs`, `dim=192` | 65.6 | 74.4 | +8.8 |
+| `cross_window`, `dim=192` | 74.4 | 80.2 | +5.8 |
+| `temporal_masked_1`, `dim=192` | 71.4 | 80.0 | +8.6 |
+
+Interpretation: `uniform_w=0.1` is too weak in this PushT setting; `0.2`
+consistently improves downstream control.
+
+#### Effect of pair sampling / structural bias
+
+At fixed `uniform_w=0.2`, `t=2`, `dim=192`:
+
+| Setting | PushT eval |
+|---|---:|
+| `all_pairs` | 74.4 |
+| `cross_window` | 80.2 |
+| `temporal_masked_1` | 80.0 |
+
+Interpretation: the main benefit is not just stronger uniformity, but applying
+it with a more appropriate pair-selection structure. Both `cross_window` and
+`temporal_masked` avoid over-penalizing temporally related samples compared with
+plain `all_pairs`.
+
+#### Effect of latent dimension
+
+At fixed `uniform_w=0.2`, `t=2`:
+
+| Setting | `dim=192` | `dim=64` | Gain |
+|---|---:|---:|---:|
+| `cross_window` | 80.2 | 82.2 | +2.0 |
+| `temporal_masked_1` | 80.0 | 81.2 | +1.2 |
+
+Interpretation: reducing latent dimension does not hurt the structured SWM
+variants here, and may slightly improve generalization. The plain
+`all_pairs, dim=64` baseline is still missing, so this should be treated as a
+trend rather than a fully isolated dimension conclusion.
+
+#### Effect of temperature `t`
+
+For `temporal_masked_1`, `uniform_w=0.2`, `dim=64`:
+
+| `t` | PushT eval |
+|---|---:|
+| 1 | 64.6 |
+| 2 | 81.2 |
+
+Interpretation: `t=2` is much better than `t=1` in the currently tested
+configuration. This is a strong signal that the uniformity temperature matters,
+but it is still based on one architecture slice rather than a full sweep.
+
+#### Effect of temporal exclusion
+
+At fixed `uniform_w=0.2`, `t=2`, `dim=64`:
+
+| Setting | PushT eval |
+|---|---:|
+| `temporal_masked_1` | 81.2 |
+| `temporal_masked_2` | **89.8** |
+
+Interpretation: increasing `temporal_exclusion` from `1` to `2` is the largest
+single improvement in this ablation. The most plausible explanation is that
+excluding a wider near-temporal neighborhood makes the repulsive uniformity
+signal less likely to fight against genuinely similar adjacent states.
+
+### Updated working interpretation for PushT
+
+The strongest SWM result in this batch does not come from larger capacity. It
+comes from a better match between the uniformity objective and PushT's temporal
+structure:
+
+- strong enough regularization (`uniform_w=0.2`)
+- pair selection that respects temporal locality
+- a moderate uniformity temperature (`t=2`)
+- larger temporal exclusion (`temporal_exclusion=2`)
+- compact latent size (`dim=64`)
+
+This suggests that for PushT, regularizer geometry and temporal sampling policy
+matter more than simply scaling embedding dimension.
+
+### Remaining gaps
+
+- `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` is still pending, so the plain
+  `all_pairs` dimension effect is not fully isolated.
+- The current `89.8` vs `89.4` comparison against `lewm` is within plausible
+  evaluation noise for `num_eval=500`; multi-seed confirmation is still needed.
+- We still need `temporal_masked_2_dim_192` to separate the effect of
+  `temporal_exclusion=2` from any interaction with `dim=64`.
+
+### Experiment record additions
+
+#### Exp 12: PushT baseline sweep with MLP+BN + uniformity (`all_pairs`)
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- projector: `MLP + BatchNorm1d`
+- pair mode: `all_pairs`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, dim=192` | 65.6 |
+| `uniform_w=0.2, t=2, dim=192` | 74.4 |
+| `uniform_w=0.2, t=2, dim=64` | pending |
+
+Interpretation:
+- The plain `all_pairs` variant is clearly weaker than the best structured
+  variants.
+- Even here, `uniform_w=0.2` provides a substantial gain over `0.1`.
+
+#### Exp 13: PushT `cross_window` ablation
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- pair mode: `cross_window`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, dim=192` | 74.4 |
+| `uniform_w=0.2, t=2, dim=192` | 80.2 |
+| `uniform_w=0.2, t=2, dim=64` | 82.2 |
+
+Interpretation:
+- Restricting uniformity pairs to cross-window pairs improves over the
+  `all_pairs` baseline.
+- The gain from `uniform_w=0.2` remains.
+- `dim=64` is slightly stronger than `dim=192` in this structured setting.
+
+#### Exp 14: PushT `temporal_masked` ablation
+
+Setup:
+- checkpoint epoch: `10`
+- eval budget: `500`
+- pair mode: `temporal_masked`
+
+Results:
+
+| Config | PushT eval |
+|---|---:|
+| `uniform_w=0.1, t=2, temporal_exclusion=1, dim=192` | 71.4 |
+| `uniform_w=0.2, t=2, temporal_exclusion=1, dim=192` | 80.0 |
+| `uniform_w=0.2, t=1, temporal_exclusion=1, dim=64` | 64.6 |
+| `uniform_w=0.2, t=2, temporal_exclusion=1, dim=64` | 81.2 |
+| `uniform_w=0.2, t=2, temporal_exclusion=2, dim=64` | **89.8** |
+
+Interpretation:
+- `temporal_masked` is competitive with `cross_window` at
+  `temporal_exclusion=1`.
+- `t=1` is too weak or poorly calibrated for this branch.
+- Increasing `temporal_exclusion` to `2` produces the best result in the whole
+  SWM PushT sweep and essentially matches the current `lewm` reference.
+
+### Next runs for PushT
+
+The current ablation is already enough to identify the most promising branch,
+but two comparisons are still missing before we can claim a clean causal story.
+
+#### Priority 1: isolate the plain `dim=64` effect
+
+Pending run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_2_dim_64` | separate the benefit of lower dimension from the benefit of `cross_window` / `temporal_masked` |
+
+Why this matters:
+- Right now `dim=64` only looks better inside the structured variants.
+- Without the plain `all_pairs, dim=64` result, we cannot tell whether lower
+  dimension is broadly helpful or only helpful when combined with better pair
+  selection.
+
+#### Priority 2: isolate the `temporal_exclusion=2` effect
+
+Recommended run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_192` | test whether the large gain from `temporal_exclusion=2` persists at higher latent dimension |
+
+Why this matters:
+- The current best run combines two changes at once: `temporal_exclusion=2` and
+  `dim=64`.
+- This leaves an unresolved interaction question: is `temporal_exclusion=2`
+  intrinsically strong, or is it especially strong only in the smaller latent
+  space?
+
+#### Priority 3: confirm temperature choice near the best branch
+
+Recommended run:
+
+| Config | Purpose |
+|---|---|
+| `swm_mlp_bn_uniform_w_0p2_t_1_temporal_masked_2_dim_64` | check whether the temperature sensitivity seen for `temporal_masked_1` also holds at `temporal_exclusion=2` |
+
+Why this matters:
+- The current evidence says `t=2` is much better than `t=1` for
+  `temporal_masked_1`.
+- We do not yet know whether the same conclusion holds for the strongest branch.
+
+#### Priority 4: move from best single run to stable best setting
+
+Recommended protocol:
+- rerun `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` with multiple
+  seeds
+- report mean and standard deviation instead of only the best single result
+
+Why this matters:
+- `89.8` vs `lewm 89.4` is too close to claim superiority from a single run.
+- The next real milestone is not a slightly higher point estimate, but showing
+  that the best SWM setting is reliably competitive with `lewm`.
+
+### Current recommendation
+
+If compute budget is limited, the cleanest next sequence is:
+
+1. run `swm_mlp_bn_uniform_w_0p2_t_2_dim_64`
+2. run `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_192`
+3. rerun `swm_mlp_bn_uniform_w_0p2_t_2_temporal_masked_2_dim_64` with multiple
+   seeds
+
+This sequence first resolves the two main ablation ambiguities, then shifts the
+goal from exploration to statistical confirmation.
