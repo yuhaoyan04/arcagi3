@@ -59,6 +59,23 @@ class JEPA(nn.Module):
     ## Inference only ##
     ####################
 
+    @staticmethod
+    def _broadcast_goal_to_prediction(goal_emb: torch.Tensor, pred_emb: torch.Tensor) -> torch.Tensor:
+        """Broadcast goal embeddings to match prediction rollout shape.
+
+        `encode(goal)` typically returns `(B, T, D)`, while rollout predictions
+        are shaped `(B, S, T, D)`. Planning cost only needs the last goal step,
+        but we align the full tensor shape first so both JEPA and SphericalJEPA
+        can share the same logic.
+        """
+        if goal_emb.ndim == pred_emb.ndim - 1:
+            goal_emb = goal_emb.unsqueeze(1)
+        if goal_emb.ndim != pred_emb.ndim:
+            raise ValueError(
+                f"goal_emb ndim {goal_emb.ndim} is incompatible with pred_emb ndim {pred_emb.ndim}"
+            )
+        return goal_emb[..., -1:, :].expand_as(pred_emb)
+
     def rollout(self, info, action_sequence, history_size: int = 3):
         """Rollout the model given an initial info dict and action sequence.
         pixels: (B, S, T, C, H, W)
@@ -115,7 +132,7 @@ class JEPA(nn.Module):
         pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
         goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
 
-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        goal_emb = self._broadcast_goal_to_prediction(goal_emb, pred_emb)
 
         # return last-step cost per action candidate
         cost = F.mse_loss(
@@ -353,7 +370,7 @@ class SphericalJEPA(JEPA):
             emb_norm=info_dict["goal_emb"],
             space=self._get_cost_space(),
         )
-        goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
+        goal_emb = self._broadcast_goal_to_prediction(goal_emb, pred_emb)
 
         pred_last = pred_emb[..., -1:, :]
         goal_last = goal_emb[..., -1:, :].detach()
