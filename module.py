@@ -254,6 +254,67 @@ def cosine_pred_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (1.0 - (pred * target).sum(dim=-1)).mean()
 
 
+def temporal_hinge_loss(
+    z_t: torch.Tensor,
+    z_tp1: torch.Tensor,
+    *,
+    margin: float,
+    metric: str,
+    squared: bool = True,
+) -> torch.Tensor:
+    """Upper hinge loss on consecutive latent pairs.
+
+    z_t, z_tp1: (..., D) consecutive latent embeddings with matching shapes.
+    metric:
+      - "l2": Euclidean distance in R^d
+      - "cosine": cosine distance 1 - cos(z_t, z_tp1), suitable for unit vectors
+
+    This encourages consecutive latents to stay close, but stops rewarding
+    them once their distance is already below the margin:
+      max(0, distance(z_t, z_{t+1}) - margin)
+    """
+    if z_t.shape != z_tp1.shape:
+        raise ValueError(
+            f"z_t and z_tp1 must have the same shape, got {z_t.shape} vs {z_tp1.shape}"
+        )
+    if margin < 0:
+        raise ValueError(f"margin must be >= 0, got {margin}")
+
+    if metric == "l2":
+        dist = torch.linalg.vector_norm(z_tp1 - z_t, dim=-1)
+    elif metric == "cosine":
+        z_t = F.normalize(z_t, dim=-1, eps=1e-8)
+        z_tp1 = F.normalize(z_tp1, dim=-1, eps=1e-8)
+        dist = 1.0 - (z_t * z_tp1).sum(dim=-1)
+    else:
+        raise ValueError(f"Unsupported temporal hinge metric: {metric}")
+
+    loss = torch.clamp_min(dist - margin, 0.0)
+    if squared:
+        loss = loss.square()
+    return loss.mean()
+
+
+def temporal_straightness(z: torch.Tensor) -> torch.Tensor:
+    """Mean cosine between consecutive latent displacement vectors.
+
+    z: (B, T, D) encoder outputs on real trajectories.
+    Returns a scalar; larger values mean temporally straighter trajectories.
+    """
+    if z.ndim != 3:
+        raise ValueError(f"z must have shape (B, T, D), got {z.shape}")
+    if z.size(1) < 3:
+        return z.new_tensor(0.0)
+
+    v = z[:, 1:] - z[:, :-1]  # (B, T-1, D)
+    v1 = v[:, :-1]  # (B, T-2, D)
+    v2 = v[:, 1:]  # (B, T-2, D)
+
+    denom = v1.norm(dim=-1) * v2.norm(dim=-1) + 1e-8
+    cos = (v1 * v2).sum(dim=-1) / denom
+    return cos.mean()
+
+
 def _pairwise_offdiag(x: torch.Tensor) -> torch.Tensor:
     """Return all off-diagonal pairwise entries for a flattened batch."""
     n = x.size(0)

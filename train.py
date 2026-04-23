@@ -16,7 +16,14 @@ except ImportError:
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg
+from module import (
+    ARPredictor,
+    Embedder,
+    MLP,
+    SIGReg,
+    temporal_hinge_loss,
+    temporal_straightness,
+)
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -25,7 +32,8 @@ def lejepa_forward(self, batch, stage, cfg):
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+    sigreg_lambd = cfg.loss.sigreg.weight
+    hinge_cfg = cfg.loss.temporal_hinge
 
     # Replace NaN values with 0 (occurs at sequence boundaries)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -44,10 +52,28 @@ def lejepa_forward(self, batch, stage, cfg):
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+    if emb.size(1) > 1:
+        output["temporal_hinge_loss"] = temporal_hinge_loss(
+            emb[:, :-1],
+            emb[:, 1:],
+            margin=hinge_cfg.margin,
+            metric="l2",
+            squared=hinge_cfg.squared,
+        )
+    else:
+        output["temporal_hinge_loss"] = emb.new_tensor(0.0)
+    output["loss"] = (
+        output["pred_loss"]
+        + sigreg_lambd * output["sigreg_loss"]
+        + hinge_cfg.weight * output["temporal_hinge_loss"]
+    )
+    output["temporal_straightness"] = temporal_straightness(emb)
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    metrics_dict = {
+        f"{stage}/temporal_straightness": output["temporal_straightness"].detach()
+    }
+    self.log_dict({**losses_dict, **metrics_dict}, on_step=True, sync_dist=True)
     return output
 
 

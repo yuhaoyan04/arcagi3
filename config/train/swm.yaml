@@ -86,6 +86,10 @@ loss:
     type: uniformity # spread, uniformity, or infonce
     space: normalized # normalized or raw
     weight: 0.1 # λ balancing pred_loss vs anti-collapse regularization
+  temporal_hinge:
+    weight: 0.0 # disabled by default
+    margin: 0.1
+    squared: True
   spread:
     margin: 0.0 # m in max(0, mu_i^T mu_j - m)^2
   uniformity:

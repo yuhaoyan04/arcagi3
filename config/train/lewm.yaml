@@ -73,3 +73,7 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  temporal_hinge:
+    weight: 0.0 # disabled by default
+    margin: 0.1
+    squared: True

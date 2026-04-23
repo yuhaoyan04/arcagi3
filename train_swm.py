@@ -24,6 +24,8 @@ from module import (
     MLP,
     infonce_loss,
     spread_loss,
+    temporal_hinge_loss,
+    temporal_straightness,
     uniformity_loss,
 )
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
@@ -113,12 +115,20 @@ def swm_forward(self, batch, stage, cfg):
     Losses:
       pred_loss   — configurable prediction loss in raw or normalized space
       reg_loss    — configurable anti-collapse loss in raw or normalized space
-      loss        — pred_loss + λ * reg_loss
+      temporal_hinge_loss — optional hinge loss on consecutive latent pairs
+      loss        — pred_loss + λ_reg * reg_loss + λ_hinge * temporal_hinge_loss
+
+    Note:
+      temporal_straightness is logged as a monitoring metric using Euclidean
+      displacement vectors between consecutive unit-norm latents. On the sphere
+      this is only a chord-space approximation, so it may not reflect true
+      geodesic straightening accurately.
     """
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     reg_type = cfg.loss.regularizer.type
-    lambd = cfg.loss.regularizer.weight
+    reg_lambd = cfg.loss.regularizer.weight
+    hinge_cfg = cfg.loss.temporal_hinge
     reg_space = cfg.loss.regularizer.get("space", "normalized")
     pred_space = cfg.loss.pred.get("space", "normalized")
     context_space = cfg.loss.pred.get("context_space", pred_space)
@@ -128,6 +138,7 @@ def swm_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
+    emb = output["emb"]  # (B, T, D), unit vectors
     act_emb = output["act_emb"]
 
     # Make training-time autoregressive context explicit so raw-consistent
@@ -161,6 +172,7 @@ def swm_forward(self, batch, stage, cfg):
         )
         output["reg_loss"] = output["uniformity_loss"]
     elif reg_type == "infonce":
+        tgt_emb = output["emb"][:, n_preds:]
         output["infonce_loss"] = infonce_loss(
             pred_emb, tgt_emb, cfg.loss.infonce.temperature
         )
@@ -168,10 +180,31 @@ def swm_forward(self, batch, stage, cfg):
     else:
         raise ValueError(f"Unsupported loss.regularizer.type: {reg_type}")
 
-    output["loss"] = output["pred_loss"] + lambd * output["reg_loss"]
+    if emb.size(1) > 1:
+        output["temporal_hinge_loss"] = temporal_hinge_loss(
+            emb[:, :-1],
+            emb[:, 1:],
+            margin=hinge_cfg.margin,
+            metric="cosine",
+            squared=hinge_cfg.squared,
+        )
+    else:
+        output["temporal_hinge_loss"] = emb.new_tensor(0.0)
+
+    output["loss"] = (
+        output["pred_loss"]
+        + reg_lambd * output["reg_loss"]
+        + hinge_cfg.weight * output["temporal_hinge_loss"]
+    )
+    # Approximate monitor only: on spherical latents this uses chord-space
+    # displacements, not a geodesic straightness measure on the manifold.
+    output["temporal_straightness"] = temporal_straightness(emb)
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    metrics_dict = {
+        f"{stage}/temporal_straightness": output["temporal_straightness"].detach()
+    }
+    self.log_dict({**losses_dict, **metrics_dict}, on_step=True, sync_dist=True)
     return output
 
 
@@ -242,7 +275,9 @@ def run(cfg):
     pred_proj = build_projection_head(hidden_dim, embed_dim, head_cfg)
     inference_cfg = cfg.wm.get("inference", {})
     pred_cfg = cfg.loss.get("pred", {})
-    training_context_space = pred_cfg.get("context_space", pred_cfg.get("space", "normalized"))
+    training_context_space = pred_cfg.get(
+        "context_space", pred_cfg.get("space", "normalized")
+    )
 
     world_model = SphericalJEPA(
         encoder=encoder,
@@ -250,7 +285,9 @@ def run(cfg):
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=pred_proj,
-        inference_rollout_state_space=inference_cfg.get("rollout_state_space", "normalized"),
+        inference_rollout_state_space=inference_cfg.get(
+            "rollout_state_space", "normalized"
+        ),
         inference_cost_space=inference_cfg.get("cost_space", "normalized"),
         inference_cost_type=inference_cfg.get("cost_type", "cosine"),
         analysis_prediction_space=cfg.loss.pred.get("space", "normalized"),
