@@ -7,7 +7,7 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 
 try:
     from swanlab.integration.pytorch_lightning import SwanLabLogger
@@ -185,20 +185,34 @@ def run(cfg):
     run_id = cfg.get("subdir") or ""
     run_dir = Path(swm.data.utils.get_cache_dir(), run_id)
 
-    logger = None
+    logger = []
     backend = cfg.get("logger_backend", "swanlab")
     if backend == "swanlab" and cfg.swanlab.enabled:
         if SwanLabLogger is None:
             raise ImportError("swanlab is not installed. Run: pip install swanlab")
-        logger = SwanLabLogger(**cfg.swanlab.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+        swanlab_config = {
+            k: v
+            for k, v in OmegaConf.to_container(cfg.swanlab.config, resolve=True).items()
+            if v is not None
+        }
+        swanlab_logger = SwanLabLogger(**swanlab_config)
+        swanlab_logger.log_hyperparams(OmegaConf.to_container(cfg))
+        logger.append(swanlab_logger)
     elif backend == "wandb" and cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
+        wandb_config = {
+            k: v
+            for k, v in OmegaConf.to_container(cfg.wandb.config, resolve=True).items()
+            if v is not None
+        }
+        wandb_logger = WandbLogger(**wandb_config)
+        wandb_logger.log_hyperparams(OmegaConf.to_container(cfg))
+        logger.append(wandb_logger)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
+
+    logger.append(CSVLogger(save_dir=run_dir, name="csv_logs"))
 
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir,
@@ -212,6 +226,7 @@ def run(cfg):
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
+        default_root_dir=run_dir,
     )
 
     manager = spt.Manager(

@@ -1,7 +1,16 @@
 # Projects
 *.tmp
 swanlog/
+swanlab/
 outputs/
+/data/
+/data.zip
+*.h5
+*.hdf5
+*.npz
+*.ckpt
+*.pt
+*.pth
 
 # Mac
 .DS_Store
